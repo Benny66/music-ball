@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Music Ball · 让球跟着节拍落下</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <section class="stage-col">
+        <div class="stage" id="stage">
+          <canvas id="view" width="720" height="1280"></canvas>
+
+          <div class="stage-empty" id="empty">
+            <div class="empty-glyph">♪</div>
+            <p class="empty-title">把一首歌拖进来</p>
+            <p class="empty-sub">球会踩在鼓点上，一层层往下滚</p>
+            <button class="btn ghost" id="pickEmpty">选择 mp3 文件</button>
+          </div>
+
+          <div class="stage-badge" id="badge" hidden></div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <header class="brand">
+          <h1>Music&nbsp;Ball</h1>
+          <p class="sub">从一首歌生成「球踩节拍逐级撞板下落」的动画，可导出 mp4</p>
+        </header>
+
+        <button class="btn primary" id="pick">选择音频文件</button>
+
+        <div class="info" id="info" hidden>
+          <div class="info-head">
+            <span class="file" id="fileName">—</span>
+            <span class="chip" id="chipBpm">— BPM</span>
+          </div>
+          <div class="info-meta" id="fileMeta"></div>
+          <canvas class="wave" id="wave" height="64"></canvas>
+          <div class="wave-legend">
+            <span><i class="dot kick"></i>底鼓</span>
+            <span><i class="dot snare"></i>军鼓</span>
+            <span><i class="dot hat"></i>踩镲</span>
+          </div>
+        </div>
+
+        <div class="transport" id="transport" hidden>
+          <button class="btn icon" id="play" aria-label="播放/暂停">▶</button>
+          <div class="seek-wrap">
+            <input type="range" id="seek" min="0" max="1000" value="0" step="1" />
+          </div>
+          <span class="time" id="time">0:00 / 0:00</span>
+        </div>
+
+        <div class="params" id="params" hidden>
+          <label class="row">
+            <span>下落速度</span>
+            <input type="range" id="speed" min="260" max="900" step="10" value="520" />
+            <b id="speedVal">520</b>
+          </label>
+          <label class="row">
+            <span>板密度</span>
+            <select id="density">
+              <option value="1">每拍一块</option>
+              <option value="2">每两拍一块</option>
+            </select>
+            <b></b>
+          </label>
+          <label class="row">
+            <span>变化幅度</span>
+            <input type="range" id="drama" min="0" max="100" step="5" value="70" />
+            <b id="dramaVal">70%</b>
+          </label>
+          <label class="row">
+            <span>时间微调</span>
+            <input type="range" id="offset" min="-300" max="300" step="5" value="0" />
+            <b id="offsetVal">0 ms</b>
+          </label>
+          <p class="row-note" id="latencyNote">已按输出设备自动补偿延迟 0 ms（仅预览；导出不受影响）</p>
+          <label class="row">
+            <span>轨迹</span>
+            <button class="btn tiny" id="reseed">换一条</button>
+            <b id="seedVal">#1</b>
+          </label>
+          <label class="row">
+            <span>物理自由度</span>
+            <input type="range" id="dof" min="0" max="100" step="10" value="100" />
+            <b id="dofVal">100%</b>
+          </label>
+          <label class="row">
+            <span>音轨</span>
+            <select id="audioMode">
+              <option value="glass">玻璃声</option>
+              <option value="mix">玻璃 + 原曲</option>
+              <option value="original">原曲</option>
+            </select>
+            <b></b>
+          </label>
+        </div>
+
+        <div class="export" id="exportBox" hidden>
+          <button class="btn primary wide" id="exportBtn">导出 MP4 · 1080×1920</button>
+          <p class="hint" id="exportHint">导出在本地完成，不上传任何数据</p>
+          <div class="progress" id="progressWrap" hidden>
+            <div class="bar"><i id="progressBar"></i></div>
+            <div class="progress-row">
+              <span id="progressText">准备中…</span>
+              <button class="btn tiny" id="cancelBtn">取消</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="log" id="log" hidden></div>
+        <footer class="foot">分析在本机完成 · 音频不会离开浏览器</footer>
+      </aside>
+    </div>
+
+    <input type="file" id="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg" hidden />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

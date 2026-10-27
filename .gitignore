@@ -1,0 +1,13 @@
+node_modules/
+dist/
+out/
+.playwright-cli/
+.DS_Store
+*.log
+fixtures/*.wav
+fixtures/*.mp3
+fixtures/real/
+public/models/
+loaded.png
+*.local
+.workbuddy/
