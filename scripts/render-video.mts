@@ -7,6 +7,7 @@
  *   --stills=1.2,3.4,5.6   只出这几秒的 PNG，用于调视觉（不合成视频）
  *   --seconds=12           只渲染前 N 秒
  *   --scale=0.5            渲染分辨率缩放（调试用，快 4 倍）
+ *   --audio=glass|mix|original  音轨（默认 glass，与浏览器默认一致）
  *   --fps=60
  *
  * 这条路不依赖浏览器，帧精确 100%：第 N 帧画的就是音频第 N/fps 秒。
@@ -19,6 +20,9 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { analyze } from '../src/analysis/pipeline.ts';
+import { fftMelody } from '../src/analysis/melody.ts';
+import { notesFromChart } from '../src/audio/glass.ts';
+import { mixInto, renderGlassTrackNode, resampleLinear, writeWavF32le } from '../src/audio/glass-node.ts';
 import { buildChart } from '../src/chart/build.ts';
 import { createAssets } from '../src/render/assets.ts';
 import { createScratch, draw } from '../src/render/draw.ts';
@@ -89,6 +93,7 @@ async function main(): Promise<void> {
   const outW = Math.round(1080 * Number(opt.scale ?? 1));
   const outH = Math.round(outW * (16 / 9));
   const stills = opt.stills ? opt.stills.split(',').map(Number) : null;
+  const audioMode = opt.audio ?? 'glass';
 
   console.log('输入:', input);
   const t0 = performance.now();
@@ -133,6 +138,25 @@ async function main(): Promise<void> {
 
   console.log(`渲染 ${totalFrames} 帧 @ ${outW}x${outH} ${fps}fps …`);
   const t2 = performance.now();
+  // ---- 音轨：与浏览器导出同一套模态合成配方 ----
+  let audioFile = input;
+  if (audioMode !== 'original') {
+    const melody = fftMelody(pcm, sr);
+    const notes = notesFromChart(chart, melody);
+    const glass = renderGlassTrackNode(notes, duration, 0x91a55);
+    let track = glass;
+    if (audioMode === 'mix') {
+      const orig48 = resampleLinear(pcm, sr, 48000);
+      const rms = (a: Float32Array): number => { let sum=0,cnt=0; for (let i=0;i<a.length;i+=7){sum+=a[i]*a[i];cnt++;} return cnt? Math.sqrt(sum/cnt):0.01; };
+      mixInto(orig48, glass, Math.min(2, (rms(orig48)/(rms(glass)||0.01)) * 0.5));
+      track = orig48;
+    }
+    const wavPath = join(dirname(output), 'audio-temp.wav');
+    writeFileSync(wavPath, writeWavF32le(track, 48000, 1));
+    audioFile = wavPath;
+    console.log(`音轨: ${audioMode}（48kHz 单声道，${Math.round(track.length/48000)}s）`);
+  }
+
   const ff = spawn('ffmpeg', [
     '-y',
     '-v', 'error',
@@ -141,7 +165,7 @@ async function main(): Promise<void> {
     '-s', `${outW}x${outH}`,
     '-r', String(fps),
     '-i', '-',
-    '-i', input,
+    '-i', audioFile,
     '-map', '0:v:0',
     '-map', '1:a:0',
     '-c:v', 'libx264',

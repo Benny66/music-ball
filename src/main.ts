@@ -142,7 +142,19 @@ function loop(): void {
       syncTransportUi();
     }
   }
-  requestAnimationFrame(loop);
+  // 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃轨，44.1k = 原曲）
+Object.assign(window as unknown as Record<string, unknown>, {
+  __mb: {
+    get mode() { return audioMode; },
+    get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
+    get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
+    get glassSr() { return glassBuffer?.sampleRate ?? 0; },
+    get glassStale() { return glassStale; },
+    get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
+  },
+});
+
+requestAnimationFrame(loop);
 }
 
 function syncTransportUi(): void {
@@ -537,4 +549,16 @@ window.addEventListener('keydown', (e) => {
 // 首帧先画一次空场景，避免白屏
 previewCtx.fillStyle = '#04050a';
 previewCtx.fillRect(0, 0, previewView.w, previewView.h);
+// 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃轨，44.1k = 原曲）
+Object.assign(window as unknown as Record<string, unknown>, {
+  __mb: {
+    get mode() { return audioMode; },
+    get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
+    get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
+    get glassSr() { return glassBuffer?.sampleRate ?? 0; },
+    get glassStale() { return glassStale; },
+    get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
+  },
+});
+
 requestAnimationFrame(loop);

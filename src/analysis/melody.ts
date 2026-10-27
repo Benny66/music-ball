@@ -102,7 +102,7 @@ export async function extractMelody(
  * 降级：每 0.1s 取一帧 2048 点 Hann，在 80–1000Hz 找能量主峰。
  * 混音流行歌上准确率有限，但足以让玻璃声「有音高、有起伏」。
  */
-function fftMelody(pcm: Float32Array, sr: number): MelodyNote[] {
+export function fftMelody(pcm: Float32Array, sr: number): MelodyNote[] {
   const N = 2048;
   const hop = Math.round(sr * 0.1);
   if (pcm.length < N) return [];

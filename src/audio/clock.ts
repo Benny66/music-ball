@@ -50,6 +50,13 @@ export class Transport {
     return this.buffer?.duration ?? 0;
   }
 
+  /** 当前装载音轨的信息（调试/支持用：48k = 玻璃轨，44.1k = 原曲） */
+  get bufferInfo(): { sampleRate: number; duration: number } | null {
+    return this.buffer
+      ? { sampleRate: this.buffer.sampleRate, duration: this.buffer.duration }
+      : null;
+  }
+
   get time(): number {
     if (!this.buffer) return 0;
     if (!this.playing) return this.pausedAt;
