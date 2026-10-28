@@ -2,8 +2,8 @@
 
 把一首歌变成「球踩在鼓点上、逐级撞板下落」的霓虹动画，并导出 1080×1920 / 60fps 的 mp4。
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)](https://vite.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.x-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)](https://vite.dev/)
 [![WebCodecs](https://img.shields.io/badge/export-WebCodecs%20%2B%20mediabunny-00C4B3)](https://mediabunny.dev)
 [![Test](https://img.shields.io/badge/%E6%8B%8D%E7%82%B9%E8%AF%AF%E5%B7%AE-2.2ms-brightgreen)](#实测数据)
 
@@ -15,6 +15,8 @@
 
 - **拍点精确到 2.2ms** —— 球在每个拍点时刻必然精确落在板上，误差是 60fps 一帧的 1/8；
   seek 到任意时刻的画面与顺序播放完全一致。
+- **钢琴独奏音符驱动** —— basic-pitch 给音符/和弦，宽频 onset 精修模型时刻；
+  板子落在音符起音上，切分、装饰音、自由速度都能跟住。
 - **真实音乐可用** —— 用 6 首流行歌实测，拍点规律度 86–100%（合成曲 100% 对拍）。
 - **物理轨迹** —— 纵向是严格的匀加速抛物线，横向由反射定律 + steering 反解倾角烘焙而成。
 - **玻璃质感** —— 球与板子都是玻璃材质，每次撞击按音乐节奏发出玻璃敲击声。
@@ -64,7 +66,20 @@ g = 2·(√h + √(h+Δy))² / Δt²
 相机是拍点 y 值的**分段线性插值**（抛物线两端点的弦）：撞击帧球严格停在屏幕 58% 线上，
 特效、粒子、震屏全部以同一个绝对坐标为基准，结构上不可能错位。
 
-## 音频分析（纯前端，零模型依赖）
+### 没有鼓的钢琴怎么办
+
+钢琴独奏没有稳定鼓组，拍网格会把切分、装饰音、自由速度抹平。音符驱动模式改为：
+
+- basic-pitch 给出音符/和弦；宽频 onset 把起点精修到真实起音（模型在重叠音/长音上会提前 60–80ms）
+- 板子落在（和弦）起音上；拍网格只负责小节相位、强弱与特殊板
+- 主导音高取和弦最高音并折回 C4–C6；>24 半音跳变按模型错误忽略，12–24 半音做 tanh 压缩
+- 快速跑动按「合并、优先强起音」处理；长音/休止用幽灵板维持运动，不补假板
+- 自动判定看高频瞬态占比：钢琴 0.04–0.06 走音符，流行/鼓组 0.11–0.26 走网格；检测到鼓组优先网格
+- 模型不可用或音符不足时回退网格并明确提示，不拿 0.1s 帧移的 FFT 旋律当时间基准
+
+这一轮只承诺**纯钢琴独奏**；轻音乐铺底、带鼓、人声流行可手动切模式，但不保证同步效果。
+
+## 音频分析（纯前端）
 
 跑在 Web Worker 里，一首 3 分钟的歌约 2 秒：
 
@@ -79,6 +94,9 @@ STFT (N=1024, hop=256, +N/2 窗中心补偿)
      只有 4 个 bin，不可用
   → 网格正则 + 小窗吸附（截尾均值估周期 + 锁相环相位跟踪 + ±40ms 吸附到真实鼓点）
 ```
+
+节拍链零模型依赖。音符驱动另走 basic-pitch（主线程，分钟级）提取旋律/和弦，
+再用宽频 onset 精修每个音符的起点；降级到 FFT 主峰时只用于音高，不作为时间基准。
 
 第三步起是针对**真实音乐**的关键：混音后的流行歌 onset 遍地都是（人声、弦乐、踩镲），
 裸 DP 的拍链会沿着「最近响一下」滑出网格。实测规律度 52–93%，网格正则后 86–100%。
@@ -97,7 +115,8 @@ vx' = vxIn·(cos²θ − e·sin²θ) + vyImp·(1+e)·sinθ·cosθ
 所以倾角由「本拍想横移多少」**反解**（`solveTilt` 二分 40 次，完全确定），
 物理负责让这一下看起来像真的，目标位置由音乐节奏决定。
 
-烘焙输出结点表（knot），运行时 `evalBall` 只查表线性插值 —— 零开销、可 seek、可并行渲染。
+烘焙输出结点表（knot）与每块板的倾角。当前运行时 `evalBall` 用三次 Hermite 求值：
+u=0/1 严格落在板上，段边界速度连续；结点表保留给后续物理后端（撞墙折点尚未接入求值）。
 matter.js 可以作为同一契约下的可插后端，但在这套「y 运动学强驱 + 瞬时接触」的架构里
 它能算的只有同一个公式，所以默认不开。
 
@@ -151,16 +170,31 @@ matter.js 可以作为同一契约下的可插后端，但在这套「y 运动�
 
 `规律度` = 拍间隔落在中位数 ±15% 内的比例。60fps 一帧是 16.7ms。
 
+音符驱动（表达性钢琴 fixture，真值音符直接入图）：
+
+| 用例 | 事件对齐 | 简单段召回 | 力度相关 |
+|---|---|---|---|
+| 切分 / 装饰音 / rubato / 长音 / 休止（真值音符直接入图） | median 0.0ms，p90 0.0ms | 100% | ρ(amp,h)=0.88 |
+| 浏览器 basic-pitch + 音频起音精修 | 匹配板 median 1.2ms，p90 2.0ms | 97.9% | — |
+
+浏览器模型路径 65 块板中 54 块落在真值起音 50ms 内；11 块是长音/和弦的模型谐波多检，
+其中 4 秒长音持续段 5 块、2 秒休止段 0 块。自动判定：钢琴 `highRatio=0.057` → 音符；
+5 首流行 `0.11–0.17` → 网格。
+
 ## 脚本
 
 ```bash
 npm run dev         # 开发服务器
 npm run build       # 生产构建
 npm run typecheck   # tsc --noEmit
-npm run testtrack   # 生成 4 首「已知标准答案」的合成测试曲
-npm run verify      # 拍点精度 / 落点精度 / 规律度 / NaN 全量校验
+npm run testtrack   # 生成 4 首「已知标准答案」的鼓组合成测试曲
+npm run pianotrack  # 生成钢琴测试曲（piano-90 + 表达性钢琴）
+npm run verify      # 鼓组/网格回归：拍点精度 / 落点精度 / 规律度 / NaN
+npm run verify:note # 音符驱动回归：事件对齐 / 力度 / 音高 / 静音段 / 自动判定
+npm run verify:note:real  # 同上，额外跑 fixtures/real 本地素材（不入库）
 
-# 不开浏览器、直接用 Node 出片（需系统装 ffmpeg；音轨为原曲）
+# 不开浏览器、直接用 Node 出片（需系统装 ffmpeg；音轨默认玻璃声，可 --audio=glass|mix|original）
+# 注意：CLI 出片目前仍走节拍网格，音符驱动只在浏览器
 node --experimental-strip-types scripts/render-video.mts <输入> <输出.mp4>
 #   --stills=1.2,3.4   只导出静帧（调视觉用）
 #   --seconds=20       只渲染前 20 秒
@@ -181,11 +215,13 @@ src/
     beats.ts            Ellis DP 拍点跟踪
     lowband.ts          低通 + 包络差分的低频 onset 链
     grid.ts             网格正则 + 小窗吸附（锁相环）
-    melody.ts           主旋律提取（basic-pitch + FFT 降级）
+    melody.ts           主旋律提取（basic-pitch + FFT 降级 + 音频 onset 精修）
+    rhythm-mode.ts      音符/网格的纯判定（鼓组优先 + 模型来源守卫）
     pipeline.ts         完整流水线（纯同步函数）
     worker.ts/client.ts Worker 封装
   chart/
     build.ts            拍点 → 运动学图表（合并/细分/预卷/扫掠/特殊板）
+    notes.ts            音符 → 和弦板（合板、密集合并、力度/主导音高）
     physics.ts          横向反射烘焙（reflectX / solveTilt / knot 表）
     ball.ts             evalBall / evalCamera —— 唯一真相
     styles.ts           板子几何与风格派生（厚度/倾角/小节相位/特殊板）
@@ -198,9 +234,18 @@ src/
     decode.ts           文件 → AudioBuffer + 单声道 PCM（固定 44.1k 解码）
     clock.ts            播放时钟（含输出设备延迟补偿）
     glass.ts            玻璃音轨合成 + 混音
+    glass-node.ts       Node 端玻璃合成（CLI 出片用）
   export/mp4.ts         mediabunny 封装 + 编码延迟自校准
   ui/waveform.ts        波形 + 拍点刻度
   main.ts               界面与状态机
+
+scripts/
+  make-testtrack.mts        鼓组合成测试曲
+  make-piano.mts            piano-90（小星星 + 分解和弦）
+  make-piano-expressive.mts 表达性钢琴（切分/装饰音/rubato/长音/休止/和弦）
+  verify.mts                鼓组/网格回归
+  verify-note.mts           音符驱动回归
+  render-video.mts          Node 出片
 ```
 
 ## 设计决策与硬性约束
@@ -221,14 +266,24 @@ src/
 
 - **导出需要 AAC 编码器**：Chrome/Edge 94+、Safari 26+。Firefox 全平台没有 AAC，
   会给出明确提示（预览不受影响）。
-- **basic-pitch 对全曲混音的旋律提取有限**（官方建议单乐器输入）。人声歌曲大体可用，
-  浓混音会漂 —— 模型失败或结果为空时自动降级为每拍 FFT 主峰。
+- **音符驱动只在浏览器**：CLI 出片仍走节拍网格。当前只承诺**纯钢琴独奏**；
+  轻音乐铺底、带鼓、人声流行可手动切模式，但不保证同步效果。
+- **basic-pitch 推理较慢**：48 秒素材在无 GPU 的浏览器里约 1–2 分钟（有进度提示）。
+  模型不可用或音符不足时回退节拍网格；FFT 降级只提供玻璃音高，不作为时间基准。
+- **音符驱动的密度控件固定**：板子由起音决定，定板后不再被 stride 抽稀。
+- **basic-pitch 会在长音持续段把谐波识别成新起音**：本轮接受并按实际记录
+  （表达性钢琴 4 秒长音内 5 块多检，2 秒休止段 0 块）；后续可用频谱新颖度过滤。
+- **横向映射会把 >24 半音的跳变视为模型八度/谐波错误**：该步保持横向，12–24 半音用
+  tanh 压缩，避免真实钢琴上的谐波让球在墙之间乱甩。
+- **横向烘焙的撞墙折点尚未接入 `evalBall`**：结点表已生成，运行时用三次 Hermite 求值。
 - 蓝牙耳机的输出延迟可能超出浏览器报告值，预览侧已自动补偿 + 可用「时间微调」手动校准；
   导出的 mp4 不受播放设备影响。
 
 ## 音频与模型来源
 
 - `fixtures/real/` 下的音乐**不入库**（版权），仅作本地测试。
+- `fixtures/piano-*.wav` 由 `npm run pianotrack` 生成（wav 不入库，truth JSON 入库）；
+  表达性钢琴覆盖切分、装饰音、rubato、长音、休止、强弱与和弦。
 - `public/models/basic-pitch/` 由 `predev`/`prebuild` 脚本从
   [`@spotify/basic-pitch`](https://www.npmjs.com/package/@spotify/basic-pitch)（Apache-2.0）复制。
 - 依赖：[`mediabunny`](https://mediabunny.dev)（MPL-2.0）、

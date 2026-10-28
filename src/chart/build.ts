@@ -67,6 +67,10 @@ interface Node {
   ghost: boolean;
   /** 真实拍序号。外推/预卷/ghost 为 -1，不参与小节相位与特殊板分配。 */
   ordinal: number;
+  /** 音符驱动：主导音高（最高音折回 C4–C6） */
+  midi?: number;
+  /** 音符驱动：原始力度（basic-pitch amplitude 0..1） */
+  dyn?: number;
 }
 
 /**
@@ -94,16 +98,9 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
         minGap: dtMin,
       })
     : null;
+  const noteDriven = !!(noteBoards && noteBoards.length >= 4);
 
-  const source =
-    noteBoards && noteBoards.length >= 4
-      ? noteBoards.map((b) => ({
-          t: b.t,
-          power: b.power,
-          band: b.band,
-          synthetic: false,
-        }))
-      : a.beats.filter((b) => Number.isFinite(b.t));
+  const source = noteDriven ? noteBoards! : a.beats.filter((b) => Number.isFinite(b.t));
 
   let nodes: Node[] = source
     .map((b) => ({
@@ -113,6 +110,8 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
       synthetic: b.synthetic,
       ghost: false,
       ordinal: b.synthetic ? -1 : ++ord,
+      midi: b.midi,
+      dyn: b.dyn,
     }));
 
   if (nodes.length < 2) {
@@ -125,7 +124,7 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
 
   nodes = mergeTooClose(nodes, dtMin);
 
-  const stride = Math.max(1, Math.round(opt.stride ?? 1));
+  const stride = Math.max(1, Math.round(noteDriven ? 1 : (opt.stride ?? 1)));
   if (stride > 1 && nodes.length > 2) {
     const last = nodes[nodes.length - 1];
     const thinned = nodes.filter((_, i) => i % stride === 0);
@@ -139,15 +138,17 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
   // 预卷：在 t=0 之前补若干块「已经路过」的板。
   // 否则视频第一秒的上半屏完全是空的 —— 相机会把球放在 58% 高度，
   // 而它上方本该有历史板滚动出去。补上之后从第 0 帧起构图就是满的。
-  nodes = prependPreRoll(nodes, Math.max(0, Math.round(opt.preRoll ?? 9)));
+  // 音符模式下前奏没有起音，预卷只能是 ghost：不画板、不发声。
+  nodes = prependPreRoll(nodes, Math.max(0, Math.round(opt.preRoll ?? 9)), noteDriven);
 
   const segCount = nodes.length - 1;
   const dts = new Float64Array(segCount);
   for (let i = 0; i < segCount; i++) dts[i] = nodes[i + 1].t - nodes[i].t;
 
   // 横向可用范围 = 半个赛道宽 − 板在「撞击膨胀 + 最大倾角」下的最大水平投影
-  const xs = buildTrackXs(nodes, trackLimit(trackW), seed);
-  const ms = buildTangents(nodes, xs, trackLimit(trackW));
+  const xLimit = trackLimit(trackW);
+  const xs = noteDriven ? buildNoteContourXs(nodes, xLimit) : buildTrackXs(nodes, xLimit, seed);
+  const ms = buildTangents(nodes, xs, xLimit);
 
   const weights = buildWeights(nodes);
   const bar = estimateBar(nodes);
@@ -217,6 +218,8 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
       ordinal,
       barPos,
       accent,
+      midi: nodes[i].midi,
+      dyn: nodes[i].dyn,
     });
 
     segs.push({
@@ -289,6 +292,8 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
       ordinal,
       barPos,
       accent,
+      midi: lastNode.midi,
+      dyn: lastNode.dyn,
     });
   }
 
@@ -330,6 +335,7 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
     trackW,
     viewH,
     seed,
+    noteDriven,
     stats: {
       detected: a.beats.reduce((k, b) => (b.synthetic ? k : k + 1), 0),
       synthetic,
@@ -394,8 +400,8 @@ function mergeTooClose(nodes: Node[], dtMin: number): Node[] {
   return out;
 }
 
-/** 在开头补若干块已路过的板，让第 0 帧的上半屏不空 */
-function prependPreRoll(nodes: Node[], count: number): Node[] {
+/** 在开头补若干块已路过的板，让第 0 帧的上半屏不空。音符模式下补 ghost。 */
+function prependPreRoll(nodes: Node[], count: number, asGhost: boolean): Node[] {
   if (count <= 0 || nodes.length < 2) return nodes;
   const T = nodes[1].t - nodes[0].t;
   if (!(T > 0)) return nodes;
@@ -407,7 +413,7 @@ function prependPreRoll(nodes: Node[], count: number): Node[] {
       power: 0.4,
       band: head.band,
       synthetic: true,
-      ghost: false,
+      ghost: asGhost,
       ordinal: -1,
     });
   }
@@ -480,6 +486,60 @@ function buildTrackXs(nodes: Node[], limit: number, seed: number): Float64Array 
       const shape = Math.sin((Math.PI * (s + 0.5)) / run);
       x += sdir * sweep * shape * scale * (0.94 + 0.12 * rng());
       xs[i] = clamp(x, -limit, limit);
+    }
+  }
+  return xs;
+}
+
+/**
+ * 音符驱动的横向轨迹：旋律上行向右、下行向左，音程越大步长越大。
+ * 接近边界时回中；ghost 结点按前后真实板线性插值，不产生随机抖动。
+ */
+function buildNoteContourXs(nodes: Node[], limit: number): Float64Array {
+  const n = nodes.length;
+  const xs = new Float64Array(n);
+  if (n === 0) return xs;
+
+  const step = limit * 0.07;
+  const bound = limit * 0.92;
+  let x = 0;
+  let prevMidi: number | null = null;
+
+  for (let i = 0; i < n; i++) {
+    const midi = nodes[i].midi;
+    if (midi === undefined) continue;
+
+    if (prevMidi !== null) {
+      let delta = midi - prevMidi;
+      // 超过两个八度的跳变几乎都是模型的八度/谐波错误，不让它把球甩到墙上
+      if (Math.abs(delta) > 24) delta = 0;
+      else delta = 12 * Math.tanh(delta / 12);
+      x += delta * step;
+    }
+    const edge = Math.abs(x) / bound;
+    if (edge > 0.65) x -= Math.sign(x) * (edge - 0.65) * 0.6 * bound;
+    x = clamp(x, -bound, bound);
+    xs[i] = x;
+    prevMidi = midi;
+  }
+
+  // ghost（预卷/长音细分）按时间在前后真实板之间插值
+  let prevReal = -1;
+  for (let i = 0; i < n; i++) {
+    if (nodes[i].midi !== undefined) {
+      prevReal = i;
+      continue;
+    }
+    let next = i + 1;
+    while (next < n && nodes[next].midi === undefined) next++;
+    if (prevReal < 0 && next < n) {
+      xs[i] = xs[next];
+    } else if (prevReal >= 0 && next >= n) {
+      xs[i] = xs[prevReal];
+    } else if (prevReal >= 0) {
+      const span = nodes[next].t - nodes[prevReal].t;
+      const u = span > 1e-9 ? clamp((nodes[i].t - nodes[prevReal].t) / span, 0, 1) : 0;
+      xs[i] = xs[prevReal] + (xs[next] - xs[prevReal]) * u;
     }
   }
   return xs;

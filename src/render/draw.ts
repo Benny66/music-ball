@@ -157,6 +157,7 @@ function drawBoards(
 
   for (; i < boards.length; i++) {
     const b = boards[i];
+    if (b.ghost && chart.noteDriven) continue;
     const sy = cy + (b.y - camY) * scale;
     const sx = view.w * 0.5 + b.x * scale;
     if (sy > view.h + 400) break;

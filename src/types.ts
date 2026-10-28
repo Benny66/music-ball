@@ -17,6 +17,10 @@ export interface Beat {
   band: Band;
   /** 是否为外推补出来的（前奏/尾声没有检测到拍） */
   synthetic: boolean;
+  /** 音符驱动：和弦板的主导音高（最高音折回 C4–C6）。网格驱动为 undefined */
+  midi?: number;
+  /** 音符驱动：原始力度（basic-pitch amplitude 0..1）。网格驱动为 undefined */
+  dyn?: number;
 }
 
 /** 分析阶段产物 */
@@ -41,6 +45,16 @@ export interface AnalysisResult {
     /** 拟合出的拍长（秒） */
     period: number;
   };
+  /**
+   * 高频通量占三频段总通量的比例（0..1）。
+   * 鼓组/打击乐的高频瞬态明显更多；钢琴独奏通常很低。
+   */
+  highRatio?: number;
+  /**
+   * 宽频 onset 峰值（谱通量抛物线细化后的时刻）。
+   * 音符驱动的模型起点用它做精修：模型负责音高/和弦，音频负责精确时刻。
+   */
+  onsets?: Array<{ t: number; strength: number }>;
 }
 
 /**
@@ -101,6 +115,10 @@ export interface Board {
   barPos: number;
   /** 重音程度 0..1，驱动撞击特效强度 */
   accent: number;
+  /** 音符驱动：主导音高（最高音折回 C4–C6）。网格驱动为 undefined */
+  midi?: number;
+  /** 音符驱动：原始力度（basic-pitch amplitude 0..1）。网格驱动为 undefined */
+  dyn?: number;
 }
 
 export interface Chart {
@@ -112,6 +130,8 @@ export interface Chart {
   /** 世界单位下的可见视口高 */
   viewH: number;
   seed: number;
+  /** 是否由音符起音驱动。渲染层据此决定 ghost 板是否要画。 */
+  noteDriven: boolean;
   /** 统计信息，UI 展示用 */
   stats: {
     detected: number;

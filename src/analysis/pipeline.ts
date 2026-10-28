@@ -83,6 +83,8 @@ export function analyze(
       beats,
       envelope: flux.env,
       hopSec: flux.hopSec,
+      highRatio: bandRatio(flux),
+      onsets: [],
     };
   }
 
@@ -139,7 +141,24 @@ export function analyze(
       snapped: grid.snappedRatio,
       period: grid.period,
     },
+    highRatio: bandRatio(flux),
+    onsets: broadPeaks.map((p) => ({ t: p.t, strength: p.strength })),
   };
+}
+
+/** 高频通量占总通量的比例。鼓组曲目通常 0.11–0.26，钢琴独奏约 0.04–0.06。 */
+function bandRatio(flux: BandFlux): number {
+  let lo = 0;
+  let mid = 0;
+  let hi = 0;
+  const n = Math.min(flux.low.length, flux.mid.length, flux.high.length);
+  for (let i = 0; i < n; i++) {
+    lo += flux.low[i];
+    mid += flux.mid[i];
+    hi += flux.high[i];
+  }
+  const total = lo + mid + hi;
+  return total > 0 ? hi / total : 0;
 }
 
 function emptyResult(sr: number, duration: number, flux: BandFlux): AnalysisResult {
@@ -151,6 +170,8 @@ function emptyResult(sr: number, duration: number, flux: BandFlux): AnalysisResu
     beats: [],
     envelope: flux?.env ?? new Float32Array(0),
     hopSec: FFT_HOP / sr,
+    highRatio: flux ? bandRatio(flux) : 0,
+    onsets: [],
   };
 }
 

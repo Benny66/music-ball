@@ -181,6 +181,47 @@ function dominantFreq(
 }
 
 /**
+ * 用音频 onset 精修模型音符的起点：
+ *   - 模型负责音高/和弦，音频负责精确时刻（basic-pitch 在重叠音上会提前 60–80ms）
+ *   - 窗口内没有起音的模型音符视为长音谐波/多检，直接丢弃
+ *   - 没有 onset 可用时原样返回，避免把整首曲子清空
+ */
+export function snapNotesToOnsets(
+  notes: MelodyNote[],
+  onsets: Array<{ t: number }>,
+  windowSec = 0.16,
+): MelodyNote[] {
+  if (onsets.length === 0) return notes;
+  const times = onsets.map((o) => o.t).sort((a, b) => a - b);
+  const out: MelodyNote[] = [];
+
+  for (const n of notes) {
+    let lo = 0;
+    let hi = times.length - 1;
+    let best = -1;
+    let bestD = Infinity;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const d = Math.abs(times[mid] - n.start);
+      if (d < bestD) {
+        bestD = d;
+        best = mid;
+      }
+      if (times[mid] < n.start) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    if (best < 0 || bestD > windowSec) continue;
+
+    const start = times[best];
+    const shift = start - n.start;
+    out.push({ ...n, start, end: Math.max(start + 0.05, n.end + shift) });
+  }
+
+  out.sort((a, b) => a.start - b.start);
+  return out;
+}
+
+/**
  * 拍点 → 音高。优先「start 距 t ≤ 0.12s 且覆盖 t 的音符」按 amplitude 加权，
  * 否则取覆盖 t 的长音；否则 null（下游用鼓组默认音高）。
  */

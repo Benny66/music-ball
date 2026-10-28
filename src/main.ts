@@ -6,7 +6,8 @@ import { createAssets, type Assets } from './render/assets.ts';
 import { createScratch, draw, type Scratch } from './render/draw.ts';
 import { exportMp4, ExportCancelled, webCodecsAvailable } from './export/mp4.ts';
 import { drawWaveform } from './ui/waveform.ts';
-import { extractMelody, type MelodyNote } from './analysis/melody.ts';
+import { extractMelody, snapNotesToOnsets, type MelodyResult } from './analysis/melody.ts';
+import { selectRhythmMode, type RhythmSource } from './analysis/rhythm-mode.ts';
 import {
   mixBuffers,
   notesFromChart,
@@ -59,15 +60,15 @@ let offsetSec = 0;
  *  否则用户为耳机把预览调准了，导出的 mp4 就跟着歪了。 */
 let exportOffsetSec = 0;
 let dof = 1;
-type RhythmSource = 'auto' | 'notes' | 'grid';
 let rhythmSource: RhythmSource = 'auto';
 /** 自动判断的结果：有旋律音符且鼓组占比低（钢琴/器乐）→ 音符驱动 */
 let rhythmEffective: 'notes' | 'grid' = 'grid';
+let rhythmReason = '';
 
 type AudioMode = 'glass' | 'original' | 'mix';
 let audioMode: AudioMode = 'glass';
 let glassBuffer: AudioBuffer | null = null;
-let melody: MelodyNote[] | null = null;
+let melodyResult: MelodyResult | null = null;
 const finalCache = new Map<AudioMode, AudioBuffer>();
 /** chart 参数变了（seed/drama/dof）玻璃轨就要重渲；滑杆拖动时用防抖，避免每帧都离线渲染 */
 let glassStale = false;
@@ -164,7 +165,7 @@ function syncTransportUi(): void {
 
 function buildGlassNotes(): GlassNote[] {
   if (!chart) return [];
-  return notesFromChart(chart, melody);
+  return notesFromChart(chart, melodyResult?.notes ?? null);
 }
 
 async function ensureGlass(): Promise<AudioBuffer> {
@@ -212,26 +213,37 @@ async function applyAudioMode(mode: AudioMode): Promise<void> {
   }
 }
 
+function updateRhythmUi(): void {
+  const isNotes = rhythmEffective === 'notes';
+  const note = $('rhythmNote');
+  note.textContent = `${isNotes ? '音符驱动' : '节拍网格'} · ${rhythmReason}`;
+  note.classList.toggle('warn', /回退|不足|还未|失败/.test(rhythmReason));
+  const density = $<HTMLSelectElement>('density');
+  density.disabled = isNotes;
+  density.title = isNotes ? '音符驱动模式下板子由音符起音决定，密度固定' : '';
+  $('densityNote').textContent = isNotes ? '音符模式固定' : '';
+}
+
 /** 自动判断节奏来源：无鼓组（kick 占比低）且有足够的旋律音符 → 音符驱动 */
 function updateRhythm(res: AnalysisResult): void {
-  let kick = 0;
-  let total = 0;
-  for (const b of res.beats) {
-    if (b.synthetic) continue;
-    total++;
-    if (b.band === 'kick') kick++;
-  }
-  const kickRatio = total > 0 ? kick / total : 1;
-  rhythmEffective =
-    rhythmSource === 'notes' ||
-    (rhythmSource === 'auto' && melody && melody.length >= 40 && kickRatio < 0.45)
-      ? 'notes'
-      : 'grid';
+  const decision = selectRhythmMode(res, melodyResult, rhythmSource);
+  rhythmEffective = decision.mode;
+  rhythmReason = decision.reason;
+  updateRhythmUi();
 }
 
 function rebuild(): void {
   if (!analysis) return;
-  chart = buildChart(analysis, { V: speedV, stride, seed, drama, dof, noteSource: rhythmEffective === 'notes' ? melody : null });
+  const noteSource =
+    rhythmEffective === 'notes' && melodyResult?.source === 'basic-pitch' ? melodyResult.notes : null;
+  chart = buildChart(analysis, {
+    V: speedV,
+    stride,
+    seed,
+    drama,
+    dof,
+    noteSource,
+  });
   $('seedVal').textContent = `#${seed}`;
   // 玻璃轨依赖 chart（声像/衰减/音高），作废并防抖刷新
   glassStale = true;
@@ -247,9 +259,12 @@ function rebuild(): void {
 
 function applyAnalysis(res: AnalysisResult): void {
   analysis = res;
-  rebuild();
-
+  // 新歌先清掉上一首的旋律，否则第一张图会用旧歌的判定
+  melodyResult = null;
+  glassBuffer = null;
+  finalCache.clear();
   updateRhythm(res);
+  rebuild();
 
   const chip = $('chipBpm');
   const bpm = res.bpm;
@@ -275,10 +290,6 @@ function applyAnalysis(res: AnalysisResult): void {
     (lowConf ? ' · 这首节奏不规整，可以试试「时间微调」' : '');
 
   drawWaveform($<HTMLCanvasElement>('wave'), res);
-  // 音轨状态全部作废（歌换了）
-  glassBuffer = null;
-  melody = null;
-  finalCache.clear();
   void applyAudioMode(audioMode);
   $('info').hidden = false;
   $('transport').hidden = false;
@@ -338,17 +349,24 @@ async function loadFile(file: File): Promise<void> {
       const mel = await extractMelody(dec.pcm, dec.sr, (p) => {
         $('fileMeta').textContent = `提取旋律 ${(p * 100).toFixed(0)}% …`;
       });
-      melody = mel.notes;
+      const refined =
+        mel.source === 'basic-pitch' ? snapNotesToOnsets(mel.notes, res.onsets ?? []) : mel.notes;
+      melodyResult = { notes: refined, source: mel.source };
       glassStale = true;
       finalCache.delete('glass');
       finalCache.delete('mix');
       $('fileMeta').textContent +=
-        ` · 旋律 ${mel.notes.length} 个音（${mel.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
+        ` · 旋律 ${refined.length} 个音（${mel.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
       updateRhythm(res);
       rebuild();
       await applyAudioMode(audioMode);
     } catch {
       $('fileMeta').textContent += ' · 旋律提取失败，玻璃声改用鼓组音高';
+      if (analysis && rhythmSource !== 'grid' && rhythmEffective !== 'notes') {
+        rhythmReason = '旋律提取失败，已回退节拍驱动';
+        updateRhythmUi();
+        rebuild();
+      }
       await applyAudioMode(audioMode);
     }
   } catch (err) {
@@ -525,6 +543,8 @@ $<HTMLInputElement>('dof').addEventListener('input', (e) => {
 
 $<HTMLSelectElement>('rhythm').addEventListener('change', (e) => {
   rhythmSource = (e.target as HTMLSelectElement).value as RhythmSource;
+  if (!analysis) return;
+  updateRhythm(analysis);
   rebuild();
 });
 
@@ -568,17 +588,36 @@ window.addEventListener('keydown', (e) => {
 previewCtx.fillStyle = '#04050a';
 previewCtx.fillRect(0, 0, previewView.w, previewView.h);
 // 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃轨，44.1k = 原曲）
-Object.assign(window as unknown as Record<string, unknown>, {
-  __mb: {
-    get mode() { return audioMode; },
-    get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
-    get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
-    get glassSr() { return glassBuffer?.sampleRate ?? 0; },
-    get glassStale() { return glassStale; },
-    get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
-    get melodyNotes() { return melody ?? []; },
-    get rhythm() { return rhythmEffective; },
+const debugApi = {
+  get mode() { return audioMode; },
+  get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
+  get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
+  get glassSr() { return glassBuffer?.sampleRate ?? 0; },
+  get glassStale() { return glassStale; },
+  get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
+  get melodyNotes() { return melodyResult?.notes ?? []; },
+  get melodySource() { return melodyResult?.source ?? null; },
+  get rhythm() { return rhythmEffective; },
+  get rhythmReason() { return rhythmReason; },
+  get chart() { return chart; },
+  get analysis() { return analysis; },
+  get melody() { return melodyResult; },
+  async loadFromUrl(url: string) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);
+    const blob = await res.blob();
+    const name = decodeURIComponent(url.split('/').pop() || 'audio');
+    await loadFile(new File([blob], name, { type: blob.type || 'audio/wav' }));
   },
+  seek(t: number) {
+    if (!decoded) return;
+    transport.seek(Math.max(0, Math.min(transport.duration, t)));
+    dirty = true;
+  },
+};
+Object.assign(window as unknown as Record<string, unknown>, {
+  __mb: debugApi,
+  __musicball: debugApi,
 });
 
 requestAnimationFrame(loop);

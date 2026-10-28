@@ -396,6 +396,10 @@ input[type='range']::-moz-range-thumb {
   color: rgba(139, 147, 176, 0.75);
 }
 
+.row-note.warn {
+  color: #ffd08a;
+}
+
 .row b {
   font-size: 11.5px;
   font-weight: 500;

@@ -34,6 +34,13 @@ function bandByPitch(minMidi: number, maxMidi: number): Band {
   return 'snare'; // 中音区
 }
 
+/** 把旋律音折回 C4–C6，避免 basic-pitch 的八度/谐波把轮廓带出可感知的音区 */
+function foldMidi(m: number): number {
+  while (m > 84) m -= 12;
+  while (m < 60) m += 12;
+  return m;
+}
+
 /**
  * 音符事件 → 板子序列。
  * 同时起音（窗口内）的音合成一块和弦板：音越多、时值越长，板越宽、弹得越高。
@@ -60,6 +67,7 @@ export function boardsFromNotes(
     count: number;
     isMelody: boolean;
     dur: number;
+    maxAmp: number;
   }
   const chords: Chord[] = [];
   let cur: Chord | null = null;
@@ -70,6 +78,7 @@ export function boardsFromNotes(
       cur.count++;
       cur.isMelody = cur.isMelody || n.amplitude >= 0.8;
       cur.dur = Math.max(cur.dur, n.end - n.start);
+      cur.maxAmp = Math.max(cur.maxAmp, n.amplitude);
       continue;
     }
     cur = {
@@ -79,33 +88,60 @@ export function boardsFromNotes(
       count: 1,
       isMelody: n.amplitude >= 0.8,
       dur: n.end - n.start,
+      maxAmp: n.amplitude,
     };
     chords.push(cur);
   }
 
-  // 3) 和弦 → 板（power 由和声规模与时值决定）
+  // 3) 和弦 → 板（power 由力度、和声规模与时值共同决定）
   const out: Beat[] = [];
-  let prevT = -1e9;
+  const strengths: number[] = [];
+  const strengthOf = (c: Chord): number =>
+    c.maxAmp + 0.05 * Math.min(3, c.count) + 0.03 * Math.min(1, c.dur);
+
+  // 力度按全曲分位数归一化，避免整首曲子都贴在最低或最高档
+  const amps = chords.map((c) => c.maxAmp).sort((a, b) => a - b);
+  const ampLo = amps[Math.min(amps.length - 1, Math.floor(amps.length * 0.1))] ?? 0;
+  const ampHi = amps[Math.min(amps.length - 1, Math.floor(amps.length * 0.9))] ?? ampLo;
+  const normAmp = (a: number): number =>
+    ampHi > ampLo ? clamp((a - ampLo) / (ampHi - ampLo), 0, 1) : 0.5;
+
   for (const c of chords) {
     const t = c.t;
-    if (t - prevT < cfg.minGap) {
-      // 比最小间隔还密：并到前一块（更新它的规模，板变宽）
-      const last = out[out.length - 1];
-      if (last) last.power = clamp(last.power + 0.12, 0, 1);
+    const band = bandByPitch(c.minMidi, c.maxMidi);
+    const spanNorm = (c.count >= 3 ? 1 : c.count === 2 ? 0.65 : 0.42) / 0.85;
+    const longNorm = clamp(c.dur / 1.2, 0, 1);
+    const power = clamp(0.55 * normAmp(c.maxAmp) + 0.3 * spanNorm + 0.15 * longNorm, 0.12, 1);
+    const dyn = clamp(c.maxAmp, 0, 1);
+    const strength = strengthOf(c);
+
+    const last = out[out.length - 1];
+    if (last && t - last.t < cfg.minGap) {
+      const before = out[out.length - 2];
+      const lastStrength = strengths[strengths.length - 1];
+      // 强起音优先：能挪到当前起音就挪过去，否则至少把它的力度并进前一块
+      if (strength > lastStrength && (!before || t - before.t >= cfg.minGap)) {
+        last.t = t;
+        last.power = clamp(Math.max(last.power, power) + 0.08, 0, 1);
+        last.band = band;
+        last.midi = foldMidi(c.maxMidi);
+        last.dyn = Math.max(last.dyn ?? 0, dyn);
+        strengths[strengths.length - 1] = strength;
+      } else {
+        last.power = clamp(last.power + 0.12, 0, 1);
+      }
       continue;
     }
-    prevT = t;
-
-    const span = c.count >= 3 ? 0.85 : c.count === 2 ? 0.65 : 0.42;
-    const long = clamp(c.dur / 1.2, 0, 0.25);
-    const power = clamp(span * 0.8 + long, 0.15, 1);
 
     out.push({
       t,
       power,
-      band: bandByPitch(c.minMidi, c.maxMidi),
+      band,
       synthetic: false,
+      midi: foldMidi(c.maxMidi),
+      dyn,
     });
+    strengths.push(strength);
   }
   return out;
 }

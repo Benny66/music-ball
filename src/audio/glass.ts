@@ -45,7 +45,8 @@ export function notesFromChart(chart: Chart, melody: MelodyNote[] | null): Glass
     const dt = i + 1 < boards.length ? boards[i + 1].t - b.t : 0.5;
     out.push({
       t: b.t,
-      midi: melody ? midiAt(melody, b.t) : null,
+      // 音符驱动的板已经带旋律音高；网格驱动才回退到 midiAt
+      midi: b.midi ?? (melody ? midiAt(melody, b.t) : null),
       band: b.band,
       accent: b.accent,
       dt: clamp(dt, 0.1, 1.5),
