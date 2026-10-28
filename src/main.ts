@@ -59,6 +59,10 @@ let offsetSec = 0;
  *  否则用户为耳机把预览调准了，导出的 mp4 就跟着歪了。 */
 let exportOffsetSec = 0;
 let dof = 1;
+type RhythmSource = 'auto' | 'notes' | 'grid';
+let rhythmSource: RhythmSource = 'auto';
+/** 自动判断的结果：有旋律音符且鼓组占比低（钢琴/器乐）→ 音符驱动 */
+let rhythmEffective: 'notes' | 'grid' = 'grid';
 
 type AudioMode = 'glass' | 'original' | 'mix';
 let audioMode: AudioMode = 'glass';
@@ -142,18 +146,6 @@ function loop(): void {
       syncTransportUi();
     }
   }
-  // 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃轨，44.1k = 原曲）
-Object.assign(window as unknown as Record<string, unknown>, {
-  __mb: {
-    get mode() { return audioMode; },
-    get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
-    get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
-    get glassSr() { return glassBuffer?.sampleRate ?? 0; },
-    get glassStale() { return glassStale; },
-    get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
-  },
-});
-
 requestAnimationFrame(loop);
 }
 
@@ -220,9 +212,26 @@ async function applyAudioMode(mode: AudioMode): Promise<void> {
   }
 }
 
+/** 自动判断节奏来源：无鼓组（kick 占比低）且有足够的旋律音符 → 音符驱动 */
+function updateRhythm(res: AnalysisResult): void {
+  let kick = 0;
+  let total = 0;
+  for (const b of res.beats) {
+    if (b.synthetic) continue;
+    total++;
+    if (b.band === 'kick') kick++;
+  }
+  const kickRatio = total > 0 ? kick / total : 1;
+  rhythmEffective =
+    rhythmSource === 'notes' ||
+    (rhythmSource === 'auto' && melody && melody.length >= 40 && kickRatio < 0.45)
+      ? 'notes'
+      : 'grid';
+}
+
 function rebuild(): void {
   if (!analysis) return;
-  chart = buildChart(analysis, { V: speedV, stride, seed, drama, dof });
+  chart = buildChart(analysis, { V: speedV, stride, seed, drama, dof, noteSource: rhythmEffective === 'notes' ? melody : null });
   $('seedVal').textContent = `#${seed}`;
   // 玻璃轨依赖 chart（声像/衰减/音高），作废并防抖刷新
   glassStale = true;
@@ -239,6 +248,8 @@ function rebuild(): void {
 function applyAnalysis(res: AnalysisResult): void {
   analysis = res;
   rebuild();
+
+  updateRhythm(res);
 
   const chip = $('chipBpm');
   const bpm = res.bpm;
@@ -333,6 +344,8 @@ async function loadFile(file: File): Promise<void> {
       finalCache.delete('mix');
       $('fileMeta').textContent +=
         ` · 旋律 ${mel.notes.length} 个音（${mel.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
+      updateRhythm(res);
+      rebuild();
       await applyAudioMode(audioMode);
     } catch {
       $('fileMeta').textContent += ' · 旋律提取失败，玻璃声改用鼓组音高';
@@ -510,6 +523,11 @@ $<HTMLInputElement>('dof').addEventListener('input', (e) => {
   rebuild();
 });
 
+$<HTMLSelectElement>('rhythm').addEventListener('change', (e) => {
+  rhythmSource = (e.target as HTMLSelectElement).value as RhythmSource;
+  rebuild();
+});
+
 $<HTMLSelectElement>('audioMode').addEventListener('change', (e) => {
   void applyAudioMode((e.target as HTMLSelectElement).value as AudioMode);
 });
@@ -558,6 +576,8 @@ Object.assign(window as unknown as Record<string, unknown>, {
     get glassSr() { return glassBuffer?.sampleRate ?? 0; },
     get glassStale() { return glassStale; },
     get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
+    get melodyNotes() { return melody ?? []; },
+    get rhythm() { return rhythmEffective; },
   },
 });
 

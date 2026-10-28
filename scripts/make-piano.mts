@@ -141,9 +141,29 @@ function main(): void {
     midi,
     end: +(T0 + (beat + durBeats) * BEAT).toFixed(4),
   }));
+  // 全部音符（旋律 + 伴奏）的精确起点 —— 用来测「音符驱动的板子」这条路
+  const allNotes = [
+    ...melodyNotes.map(([beat, midi, durBeats]) => ({
+      t: +(T0 + beat * BEAT).toFixed(4),
+      midi,
+      dur: +(durBeats * BEAT).toFixed(4),
+      isMelody: true,
+    })),
+    ...accompNotes.map(([beat, midi, durBeats]) => ({
+      t: +(T0 + beat * BEAT).toFixed(4),
+      midi,
+      dur: +(durBeats * BEAT).toFixed(4),
+      isMelody: false,
+    })),
+  ].sort((a, b) => a.t - b.t);
+
   writeFileSync(
     join(OUT_DIR, 'piano-90.truth.json'),
-    JSON.stringify({ bpm: BPM, t0: T0, beatLen: BEAT, beats, melody: melodyTruth }, null, 1),
+    JSON.stringify(
+      { bpm: BPM, t0: T0, beatLen: BEAT, beats, melody: melodyTruth, allNotes },
+      null,
+      1,
+    ),
   );
 
   console.log(`已生成 ${wavPath}`);

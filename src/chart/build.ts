@@ -1,4 +1,6 @@
 import { bakeReflectionXs } from './physics.ts';
+import { boardsFromNotes } from './notes.ts';
+import type { MelodyNote } from '../analysis/melody.ts';
 import { clamp } from '../util/math.ts';
 import { mulberry32 } from '../util/prng.ts';
 import {
@@ -39,6 +41,10 @@ export interface BuildOptions {
   drama?: number;
   /** 物理自由度 0..1。1 = 倾角由「本拍想横移多少」反解（默认）；0 = 完全按反射定律 */
   dof?: number;
+  /** 音符驱动的板子（钢琴/器乐）：传入旋律音符时，板子落在音符起点而不是节拍网格 */
+  noteSource?: MelodyNote[] | null;
+  /** 音符驱动模式的起始偏移（秒），对齐前奏 */
+  noteOffset?: number;
 }
 
 export const DEFAULT_V = 520;
@@ -82,8 +88,24 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
   // 真实拍按顺序编号；外推/预卷/ghost 一律 -1。
   // 这个序号要一路活到 Board 上，且跨越 merge/stride/split 绝不重新编号。
   let ord = -1;
-  let nodes: Node[] = a.beats
-    .filter((b) => Number.isFinite(b.t))
+  const noteBoards = opt.noteSource
+    ? boardsFromNotes(opt.noteSource, {
+        tOffset: opt.noteOffset ?? 0,
+        minGap: dtMin,
+      })
+    : null;
+
+  const source =
+    noteBoards && noteBoards.length >= 4
+      ? noteBoards.map((b) => ({
+          t: b.t,
+          power: b.power,
+          band: b.band,
+          synthetic: false,
+        }))
+      : a.beats.filter((b) => Number.isFinite(b.t));
+
+  let nodes: Node[] = source
     .map((b) => ({
       t: b.t,
       power: b.power,

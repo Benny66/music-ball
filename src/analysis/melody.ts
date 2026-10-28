@@ -56,8 +56,8 @@ export async function extractMelody(
   sr: number,
   onProgress?: (p: number) => void,
 ): Promise<MelodyResult> {
-  const resampled = await resampleTo22050(pcm, sr);
   try {
+    const resampled = await resampleTo22050(pcm, sr);
     const mod = await import('@spotify/basic-pitch');
     const model = (await getModel()) as InstanceType<typeof mod.BasicPitch>;
 
@@ -92,9 +92,8 @@ export async function extractMelody(
     if (notes.length === 0) throw new Error('basic-pitch 没有输出音符');
     return { notes, source: 'basic-pitch' };
   } catch {
-    // 模型加载失败 / 推理失败 → FFT 主峰兜底
-    const pcm22050 = resampled.getChannelData(0);
-    return { notes: fftMelody(pcm22050, 22050), source: 'fft-fallback' };
+    // 模型加载失败 / 推理失败（含 Node 里没有 OfflineAudioContext）→ FFT 主峰兜底
+    return { notes: fftMelody(pcm, sr), source: 'fft-fallback' };
   }
 }
 
