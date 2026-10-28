@@ -1,7 +1,20 @@
 import { clamp } from '../util/math.ts';
 import { hashFloat, mulberry32 } from '../util/prng.ts';
 import type { Chart } from '../types.ts';
+import type { BeadPath } from '../chart/bead.ts';
 import { midiAt, type MelodyNote } from '../analysis/melody.ts';
+import {
+  GLASS_AMPS,
+  GLASS_ATTACK_SEC,
+  GLASS_FADE_SEC,
+  GLASS_MASTER,
+  GLASS_NOISE,
+  GLASS_RATIOS,
+  glassGain,
+  glassPartialDecay,
+  glassRing,
+  softClip,
+} from './glass-recipe.ts';
 
 /**
  * 玻璃音轨：每次撞击一个「敲玻璃」声，音高跟主旋律（或鼓组）。
@@ -22,15 +35,12 @@ export interface GlassNote {
   band: 'kick' | 'snare' | 'hat';
   /** 0..1 重音程度 */
   accent: number;
-  /** 距下一拍的时间（决定衰减长短，防止密集时糊成一片） */
+  /** 距下一拍的时间（余音随间距变长，最短 0.6s） */
   dt: number;
   /** -1..1，球在赛道上的相对位置 → 声像 */
   panX: number;
 }
 
-/** 玻璃的振动模态比：不谐和正是「玻璃感」的来源（谐振的金属/木琴是整数比） */
-const RATIOS = [1, 1.6, 2.2, 2.9, 3.6];
-const AMPS = [1, 0.5, 0.34, 0.22, 0.14];
 /** 没有旋律信息时的兜底音高 */
 const BAND_MIDI = { kick: 45, snare: 52, hat: 74 } as const;
 
@@ -56,6 +66,22 @@ export function notesFromChart(chart: Chart, melody: MelodyNote[] | null): Glass
   return out;
 }
 
+/** 玻璃珠场景：每个撞击一块板，音高/力度/声像都来自该板。 */
+export function notesFromBead(path: BeadPath): GlassNote[] {
+  const half = path.trackW / 2 || 1;
+  return path.boards.map((b, i) => {
+    const next = path.boards[i + 1];
+    return {
+      t: b.t,
+      midi: b.midi,
+      band: b.band,
+      accent: b.power,
+      dt: clamp(next ? next.t - b.t : 0.5, 0.1, 1.5),
+      panX: clamp(b.centerX / half, -1, 1),
+    };
+  });
+}
+
 function makeNoise(ctx: OfflineAudioContext, rng: () => number, seconds: number): AudioBuffer {
   const len = Math.ceil(seconds * ctx.sampleRate);
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
@@ -78,7 +104,7 @@ export async function renderGlassTrack(
   const ctx = new OfflineAudioContext(1, Math.ceil(duration * sr), sr);
 
   const master = ctx.createGain();
-  master.gain.value = opts.masterGain ?? 1;
+  master.gain.value = opts.masterGain ?? GLASS_MASTER;
   master.connect(ctx.destination);
 
   const rng = mulberry32(opts.seed ?? 0x51a55);
@@ -88,8 +114,8 @@ export async function renderGlassTrack(
     if (!(n.t >= 0) || n.t > chart.duration + 0.5) continue;
     const midi = n.midi ?? BAND_MIDI[n.band];
     const freq = 440 * Math.pow(2, (midi - 69) / 12);
-    const dur = clamp(0.3 * n.dt, 0.12, 0.6);
-    const gain = n.band === 'hat' ? 0.25 : n.accent > 0.7 ? 1 : 0.5;
+    const ring = glassRing(n.dt);
+    const gain = glassGain(n.accent);
 
     // 声像跟随球的位置
     const pan = ctx.createStereoPanner();
@@ -98,44 +124,50 @@ export async function renderGlassTrack(
 
     const start = Math.max(0, n.t);
 
-    // —— 模态合成：5 个不谐和分音 ——
-    for (let k = 0; k < RATIOS.length; k++) {
+    // —— 模态合成：7 个强不谐和分音，高次模态衰减更快 ——
+    for (let k = 0; k < GLASS_RATIOS.length; k++) {
       const osc = ctx.createOscillator();
       osc.type = 'sine';
       // ±0.2% 微失谐：真实玻璃的模态频率不完全严格，完全谐和会像电子琴
       const detune = (hashFloat(Math.round(n.t * 1000) + k * 7, k) - 0.5) * 0.004;
-      osc.frequency.value = freq * RATIOS[k] * (1 + detune);
+      osc.frequency.value = freq * GLASS_RATIOS[k] * (1 + detune);
 
       const g = ctx.createGain();
-      const peak = gain * AMPS[k] * (n.band === 'kick' ? 1.25 : 1);
+      const decay = glassPartialDecay(ring, k);
+      const peak = gain * GLASS_AMPS[k];
       g.gain.setValueAtTime(0.0001, start);
-      g.gain.linearRampToValueAtTime(peak, start + 0.002);
-      g.gain.exponentialRampToValueAtTime(0.0001, start + dur * (n.band === 'kick' ? 1.4 : 1));
+      g.gain.linearRampToValueAtTime(peak, start + GLASS_ATTACK_SEC);
+      g.gain.exponentialRampToValueAtTime(peak * 0.05, start + decay);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + decay + GLASS_FADE_SEC);
 
       osc.connect(g);
       g.connect(pan);
       osc.start(start);
-      osc.stop(start + dur * (n.band === 'kick' ? 1.4 : 1) + 0.05);
+      osc.stop(start + decay + GLASS_FADE_SEC + 0.02);
     }
 
-    // —— 高通噪声 burst：玻璃的「碎」感；踩镲则以噪声为主体 ——
-    const src = ctx.createBufferSource();
-    src.buffer = noise;
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = n.band === 'hat' ? 6000 : 3000;
-    const ng = ctx.createGain();
-    const nDur = n.band === 'hat' ? 0.045 : 0.016;
-    ng.gain.setValueAtTime(gain * (n.band === 'hat' ? 0.9 : 0.3), start);
-    ng.gain.exponentialRampToValueAtTime(0.0001, start + nDur);
+    // —— 高通噪声：短促起音 + 一点高频 shimmer ——
+    for (const spec of GLASS_NOISE) {
+      const src = ctx.createBufferSource();
+      src.buffer = noise;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = spec.fc;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(gain * spec.gain, start);
+      ng.gain.exponentialRampToValueAtTime(0.0001, start + spec.dur);
 
-    src.connect(hp);
-    hp.connect(ng);
-    ng.connect(pan);
-    src.start(start, 0, nDur + 0.02);
+      src.connect(hp);
+      hp.connect(ng);
+      ng.connect(pan);
+      src.start(start, 0, spec.dur + 0.02);
+    }
   }
 
-  return ctx.startRendering();
+  const rendered = await ctx.startRendering();
+  const data = rendered.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = softClip(data[i]);
+  return rendered;
 }
 
 /** 均方根（响度） */

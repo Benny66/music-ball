@@ -14,6 +14,12 @@
     "verify": "node --experimental-strip-types scripts/verify.mts",
     "verify:note": "node --experimental-strip-types scripts/verify-note.mts",
     "verify:note:real": "node --experimental-strip-types scripts/verify-note.mts --real",
+    "verify:speed": "node --experimental-strip-types scripts/verify-speed.mts",
+    "verify:bead": "node --experimental-strip-types scripts/verify-bead.mts",
+    "verify:scene": "node --experimental-strip-types scripts/verify-scene.mts",
+    "bead:fixture": "node --experimental-strip-types scripts/bead-fixture.mts",
+    "bead:plot": "node --experimental-strip-types scripts/bead-plot.mts",
+    "bead:render": "node --experimental-strip-types scripts/render-bead.mts",
     "render": "node --experimental-strip-types scripts/render-video.mts",
     "copy:model": "mkdir -p public/models/basic-pitch && cp node_modules/@spotify/basic-pitch/model/* public/models/basic-pitch/",
     "predev": "npm run copy:model",
@@ -22,6 +28,7 @@
   "dependencies": {
     "@mediabunny/aac-encoder": "^1.62.1",
     "@spotify/basic-pitch": "^1.0.1",
+    "@tensorflow/tfjs": "^3.21.0",
     "mediabunny": "^1.62.1"
   },
   "devDependencies": {

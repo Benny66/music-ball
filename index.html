@@ -37,6 +37,7 @@
             <span class="chip" id="chipBpm">— BPM</span>
           </div>
           <div class="info-meta" id="fileMeta"></div>
+          <button class="btn tiny" id="melodyCancel" hidden>取消旋律提取</button>
           <canvas class="wave" id="wave" height="64"></canvas>
           <div class="wave-legend">
             <span><i class="dot kick"></i>底鼓</span>
@@ -55,7 +56,7 @@
 
         <div class="params" id="params" hidden>
           <label class="row">
-            <span>下落速度</span>
+            <span title="基础下落速度；实际速度会随 BPM 与音乐活跃度变化">基础速度</span>
             <input type="range" id="speed" min="260" max="900" step="10" value="520" />
             <b id="speedVal">520</b>
           </label>
@@ -68,10 +69,11 @@
             <b id="densityNote"></b>
           </label>
           <label class="row">
-            <span>变化幅度</span>
+            <span title="0% = 恒定速度/统一弹跳；100% = 速度与弹跳最大跟随音乐">变化幅度</span>
             <input type="range" id="drama" min="0" max="100" step="5" value="70" />
             <b id="dramaVal">70%</b>
           </label>
+          <p class="row-note" id="dramaNote">0% 恒定速度/统一弹跳 · 100% 最大跟随音乐</p>
           <label class="row">
             <span>时间微调</span>
             <input type="range" id="offset" min="-300" max="300" step="5" value="0" />
@@ -99,14 +101,25 @@
           </label>
           <p class="row-note" id="rhythmNote"></p>
           <label class="row">
+            <span>运动</span>
+            <select id="motion">
+              <option value="auto">自动（音符→玻璃珠）</option>
+              <option value="bead">玻璃珠</option>
+              <option value="classic">经典</option>
+            </select>
+            <b></b>
+          </label>
+          <p class="row-note" id="motionNote"></p>
+          <label class="row">
             <span>音轨</span>
             <select id="audioMode">
               <option value="glass">玻璃声</option>
               <option value="mix">玻璃 + 原曲</option>
-              <option value="original">原曲</option>
+              <option value="original" selected>原曲</option>
             </select>
             <b></b>
           </label>
+          <p class="row-note" id="audioNote"></p>
         </div>
 
         <div class="export" id="exportBox" hidden>

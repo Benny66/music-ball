@@ -644,6 +644,19 @@ test('同输入同 seed 的 Chart 完全相等', () => {
   assert.deepEqual(a, b);
 });
 
+test('长音/休止段的 V 明显降低', () => {
+  const { truth, res, notes } = fixture();
+  const chart = buildChart(res, { noteSource: notes, drama: 0.7 });
+  const long = truth.sections.find((s) => s.name === 'long-rest');
+  assert.ok(long);
+  const segs = chart.segs.map((s) => ({ t0: s.t0, v: s.dy / (s.t1 - s.t0) }));
+  const all = mean(segs.map((s) => s.v));
+  const gap = segs.filter((s) => s.t0 >= long.start && s.t0 < long.start + 6);
+  assert.ok(gap.length > 2);
+  const gapMean = mean(gap.map((s) => s.v));
+  assert.ok(gapMean < all * 0.9, `长音段 V 没有明显降低: gap=${gapMean.toFixed(1)} all=${all.toFixed(1)}`);
+});
+
 // ---------- runner ----------
 
 let failed = 0;

@@ -1,16 +1,25 @@
 import { clamp } from '../util/math.ts';
 import { hashFloat, mulberry32 } from '../util/prng.ts';
 import { GLASS_SR } from './glass.ts';
+import {
+  GLASS_AMPS,
+  GLASS_ATTACK_SEC,
+  GLASS_FADE_SEC,
+  GLASS_MASTER,
+  GLASS_NOISE,
+  GLASS_RATIOS,
+  glassGain,
+  glassPartialDecay,
+  glassRing,
+  softClip,
+} from './glass-recipe.ts';
 
 /**
  * Node 端的玻璃音轨合成器。
  *
- * 与 `glass.ts`（浏览器 OfflineAudioContext）用的是同一套模态合成配方与同一个 seed，
- * 目的是让命令行出片（`scripts/render-video.mts`）的音轨和浏览器导出一致 ——
- * 否则用户会看到「浏览器导出是玻璃声、命令行出的是原曲」这种不一致。
- *
- * OfflineAudioContext 在 Node 里不存在，所以这里直接往 Float32Array 里叠加样本：
- * 每个音符 = 5 个不谐和正弦分音（指数衰减）+ 一阶高通的白噪 burst。
+ * 与 `glass.ts`（浏览器 OfflineAudioContext）共用 `glass-recipe.ts` 的参数与 seed。
+ * OfflineAudioContext 在 Node 里不存在，所以这里直接往 Float32Array 里叠加样本；
+ * WebAudio 与纯 JS 的滤波/声像实现略有差异，但音色、模态比例与包络一致。
  */
 
 export interface GlassNoteNode {
@@ -22,8 +31,6 @@ export interface GlassNoteNode {
   panX: number;
 }
 
-const RATIOS = [1, 1.6, 2.2, 2.9, 3.6];
-const AMPS = [1, 0.5, 0.34, 0.22, 0.14];
 const BAND_MIDI = { kick: 45, snare: 52, hat: 74 } as const;
 
 /** 一阶高通滤波（用于噪声 burst，去掉低频轰隆声） */
@@ -64,50 +71,50 @@ export function renderGlassTrackNode(
     if (!(n.t >= 0) || n.t > durationSec + 0.5) continue;
     const midi = n.midi ?? BAND_MIDI[n.band];
     const freq = 440 * Math.pow(2, (midi - 69) / 12);
-    const dur = clamp(0.3 * n.dt, 0.12, 0.6);
-    const gain = n.band === 'hat' ? 0.25 : n.accent > 0.7 ? 1 : 0.5;
+    const ring = glassRing(n.dt);
+    const gain = glassGain(n.accent);
     // 单声道输出不做声像，但保留 pan 的能量差（±3dB）以免左右失衡
     const panGain = 1 - Math.min(0.6, Math.abs(n.panX) * 0.3);
     const start = Math.max(0, Math.round(n.t * sr));
+    const attack = Math.max(1, Math.round(GLASS_ATTACK_SEC * sr));
+    const fade = Math.max(1, Math.round(GLASS_FADE_SEC * sr));
 
-    // —— 模态合成：5 个不谐和分音 ——
-    for (let k = 0; k < RATIOS.length; k++) {
+    // —— 模态合成：7 个强不谐和分音，高次模态衰减更快 ——
+    for (let k = 0; k < GLASS_RATIOS.length; k++) {
       const detune = (hashFloat(Math.round(n.t * 1000) + k * 7, k) - 0.5) * 0.004;
-      const f = freq * RATIOS[k] * (1 + detune);
+      const f = freq * GLASS_RATIOS[k] * (1 + detune);
       const w = (2 * Math.PI * f) / sr;
-      const decay = sr * dur * (n.band === 'kick' ? 1.4 : 1);
-      const peak = gain * AMPS[k] * (n.band === 'kick' ? 1.25 : 1) * panGain;
-      const attack = Math.max(1, Math.round(0.002 * sr));
-      const len = Math.min(total - start, Math.round(decay) + attack);
+      const decaySec = glassPartialDecay(ring, k);
+      const decaySamples = Math.max(1, Math.round(decaySec * sr));
+      const peak = gain * GLASS_AMPS[k] * panGain;
+      const len = Math.min(total - start, decaySamples + fade);
       let phase = 0;
       for (let i = 0; i < len; i++) {
-        const env = i < attack ? i / attack : Math.exp(-(i - attack) / (decay * 0.32));
         const idx = start + i;
         if (idx >= total) break;
+        let env = i < attack ? i / attack : Math.exp(-(i - attack) / ((decaySec / 3) * sr));
+        if (i >= decaySamples) env *= Math.max(0, 1 - (i - decaySamples) / fade);
         out[idx] += Math.sin(phase) * peak * env;
         phase += w;
       }
     }
 
-    // —— 高通噪声 burst ——
-    const nDur = n.band === 'hat' ? 0.045 : 0.016;
-    const nLen = Math.min(rawNoise.length, Math.round(nDur * sr));
-    const ng = highpass(rawNoise.subarray(0, nLen), n.band === 'hat' ? 6000 : 3000, sr);
-    const nPeak = gain * (n.band === 'hat' ? 0.9 : 0.3) * panGain;
-    for (let i = 0; i < nLen; i++) {
-      const idx = start + i;
-      if (idx >= total) break;
-      const env = Math.exp(-i / (nLen * 0.25));
-      out[idx] += ng[i] * nPeak * env;
+    // —— 高通噪声：短促起音 + 一点高频 shimmer ——
+    for (const spec of GLASS_NOISE) {
+      const nLen = Math.min(rawNoise.length, Math.round(spec.dur * sr));
+      const ng = highpass(rawNoise.subarray(0, nLen), spec.fc, sr);
+      const nPeak = gain * spec.gain * panGain;
+      for (let i = 0; i < nLen; i++) {
+        const idx = start + i;
+        if (idx >= total) break;
+        const env = Math.exp(-i / (nLen * 0.25));
+        out[idx] += ng[i] * nPeak * env;
+      }
     }
   }
 
-  // 软限幅，防止叠加爆音
-  for (let i = 0; i < out.length; i++) {
-    const v = out[i];
-    if (v > 1) out[i] = 1 - 1 / (v + 1);
-    else if (v < -1) out[i] = -1 + 1 / (1 - v);
-  }
+  // 主增益 + 软限幅，防止长余音叠加爆音
+  for (let i = 0; i < out.length; i++) out[i] = softClip(out[i] * GLASS_MASTER);
   return out;
 }
 

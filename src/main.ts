@@ -1,15 +1,18 @@
 import { Transport } from './audio/clock.ts';
 import { decodeFile, type DecodedAudio } from './audio/decode.ts';
 import { analyzeInWorker } from './analysis/client.ts';
-import { buildChart, DEFAULT_TRACK_W } from './chart/build.ts';
+import { DEFAULT_TRACK_W } from './chart/build.ts';
+import { buildScene, type MotionChoice, type Scene } from './chart/scene.ts';
 import { createAssets, type Assets } from './render/assets.ts';
-import { createScratch, draw, type Scratch } from './render/draw.ts';
+import { createSceneScratch, drawScene, type SceneScratch } from './render/scene.ts';
 import { exportMp4, ExportCancelled, webCodecsAvailable } from './export/mp4.ts';
 import { drawWaveform } from './ui/waveform.ts';
-import { extractMelody, snapNotesToOnsets, type MelodyResult } from './analysis/melody.ts';
+import { fftMelody, resampleTo22050, snapNotesToOnsets, type MelodyResult } from './analysis/melody.ts';
+import { startMelodyInWorker, type MelodyHandle } from './analysis/melody-client.ts';
 import { selectRhythmMode, type RhythmSource } from './analysis/rhythm-mode.ts';
 import {
   mixBuffers,
+  notesFromBead,
   notesFromChart,
   renderGlassTrack,
   resampleTo48k,
@@ -49,7 +52,9 @@ const decodeCtx = new OfflineAudioContext(1, 1, DECODE_SR);
 
 let decoded: DecodedAudio | null = null;
 let analysis: AnalysisResult | null = null;
+let scene: Scene | null = null;
 let chart: Chart | null = null;
+let motionChoice: MotionChoice = 'auto';
 
 let seed = 0x5eed;
 let speedV = 520;
@@ -66,9 +71,15 @@ let rhythmEffective: 'notes' | 'grid' = 'grid';
 let rhythmReason = '';
 
 type AudioMode = 'glass' | 'original' | 'mix';
-let audioMode: AudioMode = 'glass';
+let audioMode: AudioMode = 'original';
+/** 音轨切换的请求序号：旧渲染晚返回时不能覆盖新音轨 */
+let audioToken = 0;
 let glassBuffer: AudioBuffer | null = null;
 let melodyResult: MelodyResult | null = null;
+let melodyHandle: MelodyHandle | null = null;
+let melodyGen = 0;
+let loadGen = 0;
+let pendingMelodyApply = false;
 const finalCache = new Map<AudioMode, AudioBuffer>();
 /** chart 参数变了（seed/drama/dof）玻璃轨就要重渲；滑杆拖动时用防抖，避免每帧都离线渲染 */
 let glassStale = false;
@@ -96,7 +107,7 @@ viewCanvas.width = previewView.w;
 viewCanvas.height = previewView.h;
 
 const previewAssets: Assets = createAssets(makeCanvas, previewView);
-const previewScratch: Scratch = createScratch();
+const previewScratch: SceneScratch = createSceneScratch();
 
 // ---------- 工具 ----------
 
@@ -122,10 +133,10 @@ function clearLog(): void {
 // ---------- 渲染循环 ----------
 
 function renderNow(): void {
-  if (!chart) return;
-  draw(
+  if (!scene) return;
+  drawScene(
     previewCtx,
-    chart,
+    scene,
     transport.time + offsetSec - transport.outputCompensation,
     previewView,
     previewAssets,
@@ -136,11 +147,11 @@ function renderNow(): void {
 let lastSeekSync = 0;
 
 function loop(): void {
-  if (chart && (transport.playing || dirty)) {
+  if (scene && (transport.playing || dirty)) {
     renderNow();
     dirty = false;
   }
-  if (chart) {
+  if (scene) {
     const now = performance.now();
     if (now - lastSeekSync > 60) {
       lastSeekSync = now;
@@ -164,6 +175,7 @@ function syncTransportUi(): void {
 // ---------- 建图 ----------
 
 function buildGlassNotes(): GlassNote[] {
+  if (scene?.motion === 'bead' && scene.bead) return notesFromBead(scene.bead);
   if (!chart) return [];
   return notesFromChart(chart, melodyResult?.notes ?? null);
 }
@@ -198,18 +210,33 @@ async function getFinalBuffer(mode: AudioMode): Promise<AudioBuffer> {
   return out;
 }
 
+function setAudioStatus(text: string, warn = false): void {
+  const el = $('audioNote');
+  el.textContent = text;
+  el.classList.toggle('warn', warn);
+}
+
 async function applyAudioMode(mode: AudioMode): Promise<void> {
   audioMode = mode;
+  const token = ++audioToken;
   const btn = $<HTMLButtonElement>('exportBtn');
   btn.disabled = true;
+  setAudioStatus(mode === 'original' ? '切换到原曲…' : '玻璃音轨生成中…');
   try {
     const buf = await getFinalBuffer(mode);
+    if (token !== audioToken) return;
     await transport.swapBuffer(buf);
+    if (token !== audioToken) return;
     dirty = true;
+    setAudioStatus(
+      mode === 'original' ? '当前：原曲' : mode === 'mix' ? '当前：玻璃 + 原曲' : '当前：玻璃声',
+    );
   } catch (err) {
+    if (token !== audioToken) return;
+    setAudioStatus('音轨切换失败，保留当前音轨', true);
     showLog(`切换音轨失败：${err instanceof Error ? err.message : String(err)}`);
   } finally {
-    btn.disabled = exporting;
+    if (token === audioToken) btn.disabled = exporting;
   }
 }
 
@@ -222,6 +249,20 @@ function updateRhythmUi(): void {
   density.disabled = isNotes;
   density.title = isNotes ? '音符驱动模式下板子由音符起音决定，密度固定' : '';
   $('densityNote').textContent = isNotes ? '音符模式固定' : '';
+  updateMotionUi();
+}
+
+function updateMotionUi(): void {
+  const sel = $<HTMLSelectElement>('motion');
+  const beadOpt = sel.querySelector<HTMLOptionElement>('option[value="bead"]');
+  const canBead = rhythmEffective === 'notes' && !!chart?.noteDriven;
+  if (beadOpt) beadOpt.disabled = !canBead;
+  sel.value = canBead ? motionChoice : 'classic';
+  sel.title = canBead ? '音符驱动默认可选玻璃珠；经典随时可回退' : '网格/鼓组暂用经典运动';
+  const note = $('motionNote');
+  if (!canBead) note.textContent = '网格/鼓组暂用经典运动';
+  else note.textContent = scene?.reason ?? '玻璃珠';
+  note.classList.toggle('warn', /回退|失败|暂用/.test(note.textContent ?? ''));
 }
 
 /** 自动判断节奏来源：无鼓组（kick 占比低）且有足够的旋律音符 → 音符驱动 */
@@ -236,14 +277,16 @@ function rebuild(): void {
   if (!analysis) return;
   const noteSource =
     rhythmEffective === 'notes' && melodyResult?.source === 'basic-pitch' ? melodyResult.notes : null;
-  chart = buildChart(analysis, {
+  scene = buildScene(analysis, {
     V: speedV,
     stride,
     seed,
     drama,
     dof,
     noteSource,
+    motion: motionChoice,
   });
+  chart = scene.chart;
   $('seedVal').textContent = `#${seed}`;
   // 玻璃轨依赖 chart（声像/衰减/音高），作废并防抖刷新
   glassStale = true;
@@ -252,8 +295,9 @@ function rebuild(): void {
   if (audioRefreshTimer) clearTimeout(audioRefreshTimer);
   audioRefreshTimer = window.setTimeout(() => {
     audioRefreshTimer = 0;
-    if (decoded) void applyAudioMode(audioMode);
+    if (decoded && audioMode !== 'original') void applyAudioMode(audioMode);
   }, 450);
+  updateMotionUi();
   dirty = true;
 }
 
@@ -290,7 +334,7 @@ function applyAnalysis(res: AnalysisResult): void {
     (lowConf ? ' · 这首节奏不规整，可以试试「时间微调」' : '');
 
   drawWaveform($<HTMLCanvasElement>('wave'), res);
-  void applyAudioMode(audioMode);
+  if (audioMode !== 'original') void applyAudioMode(audioMode);
   $('info').hidden = false;
   $('transport').hidden = false;
   $('params').hidden = false;
@@ -303,9 +347,106 @@ function applyAnalysis(res: AnalysisResult): void {
 
 // ---------- 加载 ----------
 
+function resetMelodyWorker(): void {
+  melodyGen++;
+  melodyHandle?.cancel();
+  melodyHandle = null;
+  pendingMelodyApply = false;
+  $('melodyCancel').hidden = true;
+}
+
+function invalidateGlass(): void {
+  glassStale = true;
+  finalCache.delete('glass');
+  finalCache.delete('mix');
+}
+
+function applyMelodyChart(res: AnalysisResult, note = ''): void {
+  if (!melodyResult) return;
+  pendingMelodyApply = false;
+  invalidateGlass();
+  $('fileMeta').textContent +=
+    note ||
+    ` · 旋律 ${melodyResult.notes.length} 个音（${melodyResult.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
+  updateRhythm(res);
+  rebuild();
+  if (audioMode !== 'original') void applyAudioMode(audioMode);
+}
+
+function applyPendingMelody(): void {
+  if (!pendingMelodyApply || !analysis || !melodyResult) return;
+  applyMelodyChart(analysis, ` · 已应用音符驱动（${melodyResult.notes.length} 音）`);
+}
+
+function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
+  const gen = ++melodyGen;
+  melodyHandle?.cancel();
+  melodyHandle = null;
+  pendingMelodyApply = false;
+  const cancelBtn = $<HTMLButtonElement>('melodyCancel');
+  cancelBtn.hidden = false;
+  $('fileMeta').textContent += ' · 加载旋律模型…';
+
+  void (async () => {
+    try {
+      const pcm22 = await resampleTo22050(dec.pcm, dec.sr);
+      if (gen !== melodyGen) return;
+
+      const handle = startMelodyInWorker(pcm22, (p) => {
+        if (gen !== melodyGen) return;
+        $('fileMeta').textContent =
+          p.phase === 'model' ? '加载旋律模型…' : `提取旋律 ${(p.ratio * 100).toFixed(0)}% …`;
+      });
+      melodyHandle = handle;
+      const mel = await handle.promise;
+      if (gen !== melodyGen) return;
+
+      melodyHandle = null;
+      cancelBtn.hidden = true;
+      const refined =
+        mel.source === 'basic-pitch' ? snapNotesToOnsets(mel.notes, res.onsets ?? []) : mel.notes;
+      const result: MelodyResult = { notes: refined, source: mel.source };
+      melodyResult = result;
+      invalidateGlass();
+
+      const decision = selectRhythmMode(res, result, rhythmSource);
+      if (rhythmSource === 'auto' && decision.mode === 'notes' && transport.playing) {
+        pendingMelodyApply = true;
+        $('fileMeta').textContent +=
+          ` · 音符驱动已就绪（${refined.length} 音），暂停/跳转后应用`;
+        if (audioMode !== 'original') void applyAudioMode(audioMode);
+      } else {
+        applyMelodyChart(res);
+      }
+    } catch (err) {
+      if (gen !== melodyGen) return;
+      melodyHandle = null;
+      cancelBtn.hidden = true;
+      const notes = fftMelody(dec.pcm, dec.sr);
+      melodyResult = { notes, source: 'fft-fallback' };
+      invalidateGlass();
+      $('fileMeta').textContent += ' · 旋律提取失败，已降级 FFT';
+      applyMelodyChart(res);
+      console.warn('[melody] worker failed', err);
+    }
+  })();
+}
+
+function cancelMelody(): void {
+  resetMelodyWorker();
+  if (!analysis) return;
+  melodyResult = null;
+  updateRhythm(analysis);
+  rebuild();
+  $('fileMeta').textContent += ' · 已取消旋律提取，使用节拍网格';
+  if (audioMode !== 'original') void applyAudioMode(audioMode);
+}
+
 async function loadFile(file: File): Promise<void> {
   if (busy) return;
   busy = true;
+  const loadToken = ++loadGen;
+  resetMelodyWorker();
   clearLog();
   $('fileName').textContent = file.name;
 
@@ -320,6 +461,12 @@ async function loadFile(file: File): Promise<void> {
 
     decoded = dec;
     transport.setBuffer(dec.buffer);
+
+    // 新歌默认原曲：上一首还在渲染的玻璃轨立即失效
+    audioToken++;
+    audioMode = 'original';
+    $<HTMLSelectElement>('audioMode').value = 'original';
+    setAudioStatus('当前为原曲；切到玻璃声会先生成玻璃音轨');
 
     const pcmCopy = dec.pcm.slice();
     const res = await analyzeInWorker(pcmCopy, dec.sr, dec.duration, (p) => {
@@ -344,42 +491,20 @@ async function loadFile(file: File): Promise<void> {
     $('fileMeta').textContent += ` · 分析耗时 ${ms}ms`;
     dirty = true;
 
-    // 旋律提取（玻璃声的音高来源）。失败时内部自动降级成 FFT 主峰。
-    try {
-      const mel = await extractMelody(dec.pcm, dec.sr, (p) => {
-        $('fileMeta').textContent = `提取旋律 ${(p * 100).toFixed(0)}% …`;
-      });
-      const refined =
-        mel.source === 'basic-pitch' ? snapNotesToOnsets(mel.notes, res.onsets ?? []) : mel.notes;
-      melodyResult = { notes: refined, source: mel.source };
-      glassStale = true;
-      finalCache.delete('glass');
-      finalCache.delete('mix');
-      $('fileMeta').textContent +=
-        ` · 旋律 ${refined.length} 个音（${mel.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
-      updateRhythm(res);
-      rebuild();
-      await applyAudioMode(audioMode);
-    } catch {
-      $('fileMeta').textContent += ' · 旋律提取失败，玻璃声改用鼓组音高';
-      if (analysis && rhythmSource !== 'grid' && rhythmEffective !== 'notes') {
-        rhythmReason = '旋律提取失败，已回退节拍驱动';
-        updateRhythmUi();
-        rebuild();
-      }
-      await applyAudioMode(audioMode);
-    }
+    // 分析完成后立即释放文件选择；旋律在后台 Worker 继续，可取消/换歌。
+    busy = false;
+    startMelodyFor(dec, res);
   } catch (err) {
     showLog(err instanceof Error ? err.message : String(err));
   } finally {
-    busy = false;
+    if (loadToken === loadGen) busy = false;
   }
 }
 
 // ---------- 导出 ----------
 
 async function runExport(): Promise<void> {
-  if (!chart || !decoded || exporting) return;
+  if (!scene || !decoded || exporting) return;
 
   if (!webCodecsAvailable()) {
     showLog('这个浏览器不支持 WebCodecs，无法在本地导出 MP4。\n请使用 Chrome / Edge，或 Safari 26+。');
@@ -429,12 +554,12 @@ async function runExport(): Promise<void> {
 
     const t0 = performance.now();
     const result = await exportMp4({
-      chart,
+      scene,
       audioBuffer: await getFinalBuffer(audioMode),
       canvas,
       view: exportView,
       assets: exportAssets,
-      scratch: createScratch(),
+      sceneScratch: createSceneScratch(),
       fps: FPS,
       videoBitrate: VIDEO_BITRATE,
       probeCtx: decodeCtx,
@@ -501,12 +626,15 @@ stage.addEventListener('drop', (e) => {
 
 $('play').addEventListener('click', () => {
   if (!decoded) return;
-  if (transport.playing) transport.pause();
-  else void transport.play();
+  if (transport.playing) {
+    transport.pause();
+    applyPendingMelody();
+  } else void transport.play();
 });
 
 transport.onEnded = () => {
   dirty = true;
+  applyPendingMelody();
   syncTransportUi();
 };
 
@@ -518,6 +646,7 @@ seekEl.addEventListener('input', () => {
   if (!decoded) return;
   transport.seek((Number(seekEl.value) / 1000) * transport.duration);
   dirty = true;
+  applyPendingMelody();
 });
 seekEl.addEventListener('pointerup', () => {
   scrubbing = false;
@@ -544,12 +673,29 @@ $<HTMLInputElement>('dof').addEventListener('input', (e) => {
 $<HTMLSelectElement>('rhythm').addEventListener('change', (e) => {
   rhythmSource = (e.target as HTMLSelectElement).value as RhythmSource;
   if (!analysis) return;
+  if (pendingMelodyApply) {
+    if (rhythmSource === 'notes') {
+      applyPendingMelody();
+      return;
+    }
+    if (rhythmSource === 'grid') {
+      pendingMelodyApply = false;
+      $('fileMeta').textContent += ' · 已改为节拍网格';
+    }
+    if (rhythmSource === 'auto') return;
+  }
   updateRhythm(analysis);
   rebuild();
 });
 
 $<HTMLSelectElement>('audioMode').addEventListener('change', (e) => {
   void applyAudioMode((e.target as HTMLSelectElement).value as AudioMode);
+});
+
+$<HTMLSelectElement>('motion').addEventListener('change', (e) => {
+  motionChoice = (e.target as HTMLSelectElement).value as MotionChoice;
+  if (!analysis) return;
+  rebuild();
 });
 
 $<HTMLInputElement>('drama').addEventListener('input', (e) => {
@@ -575,33 +721,52 @@ $('exportBtn').addEventListener('click', () => void runExport());
 $('cancelBtn').addEventListener('click', () => {
   cancelRequested = true;
 });
+$('melodyCancel').addEventListener('click', () => cancelMelody());
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && decoded && !(e.target instanceof HTMLInputElement)) {
     e.preventDefault();
-    if (transport.playing) transport.pause();
-    else void transport.play();
+    if (transport.playing) {
+      transport.pause();
+      applyPendingMelody();
+    } else void transport.play();
   }
 });
 
 // 首帧先画一次空场景，避免白屏
 previewCtx.fillStyle = '#04050a';
 previewCtx.fillRect(0, 0, previewView.w, previewView.h);
-// 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃轨，44.1k = 原曲）
+// 支持/调试用：暴露当前播放音轨的信息（48k = 玻璃/混音/重采样原曲，44.1k = 初始原曲）
 const debugApi = {
   get mode() { return audioMode; },
   get playingSr() { return transport.bufferInfo?.sampleRate ?? 0; },
   get playingDur() { return +(transport.bufferInfo?.duration ?? 0).toFixed(2); },
   get glassSr() { return glassBuffer?.sampleRate ?? 0; },
+  get glassPeak() {
+    if (!glassBuffer) return 0;
+    const d = glassBuffer.getChannelData(0);
+    let p = 0;
+    for (let i = 0; i < d.length; i++) p = Math.max(p, Math.abs(d[i]));
+    return +p.toFixed(3);
+  },
+  get glassRms() { return glassBuffer ? +rmsOf(glassBuffer).toFixed(3) : 0; },
   get glassStale() { return glassStale; },
+  get glassNoteCount() { return buildGlassNotes().length; },
   get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
   get melodyNotes() { return melodyResult?.notes ?? []; },
   get melodySource() { return melodyResult?.source ?? null; },
   get rhythm() { return rhythmEffective; },
   get rhythmReason() { return rhythmReason; },
   get chart() { return chart; },
+  get scene() { return scene; },
+  get motion() { return scene?.motion ?? null; },
+  get motionChoice() { return motionChoice; },
+  get motionReason() { return scene?.reason ?? ''; },
+  get bead() { return scene?.bead ?? null; },
   get analysis() { return analysis; },
   get melody() { return melodyResult; },
+  get melodyPending() { return pendingMelodyApply; },
+  get melodyBusy() { return melodyHandle !== null; },
   async loadFromUrl(url: string) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);

@@ -169,10 +169,10 @@ export function assignKinds(
  * 音乐强弱 → 本段弹跳高度。
  * drama=0 时恒为 Δy/3，精确复刻旧实现（等价于 g = 6V/Δt、恢复系数 0.5）。
  *
- * 区间 0.15..0.65：弱拍几乎贴着板掠过，重拍高高弹起 —— 屏幕上的顶点高度能差 3 倍。
+ * 区间 0.12..0.68：弱拍几乎贴着板掠过，重拍高高弹起 —— 屏幕上的顶点高度能差 5 倍。
  */
 export function bounceRatio(w: number, drama: number): number {
-  return lerp(1 / 3, 0.15 + 0.5 * clamp(w, 0, 1), drama);
+  return lerp(1 / 3, 0.12 + 0.56 * clamp(w, 0, 1), drama);
 }
 
 /** 音乐强弱 → 板宽 / 板厚 */

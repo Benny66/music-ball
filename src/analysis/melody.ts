@@ -1,14 +1,13 @@
 import { clamp } from '../util/math.ts';
 
 /**
- * 主旋律提取。
+ * 主旋律提取的纯逻辑与重采样接缝。
  *
- * 主路径：`@spotify/basic-pitch`（Spotify 的轻量 AMT 模型，Apache-2.0，TFJS 约 1MB）。
- *   它输出**带时间的音符事件**，玻璃声按音高演奏 —— 听起来像玻璃风琴在弹这首歌的旋律。
- * 降级路径：每拍在 80–1000Hz 找 FFT 主峰。对混音后的流行歌准确率有限（能量峰 ≠ 主旋律），
- *   但能保证「有音高、有变化」，不会因为模型加载失败就让玻璃声变成纯打击乐。
+ * 模型推理在 `melody-model.ts`（由 Worker 导入）；这里保留 FFT 降级、onset 精修、
+ * 音高查询和 22.05kHz 重采样 —— 全部可在主线程/Node 里跑。
  *
- * 两条路径产出**同构**的结果，下游无感。
+ * 降级路径：每 0.1s 取一帧 2048 点 Hann，在 80–1000Hz 找能量主峰。对混音后的流行歌
+ * 准确率有限（能量峰 ≠ 主旋律），但能保证「有音高、有变化」。
  */
 
 export interface MelodyNote {
@@ -24,21 +23,8 @@ export interface MelodyResult {
   source: 'basic-pitch' | 'fft-fallback';
 }
 
-let modelPromise: Promise<unknown> | null = null;
-
-/** 惰性加载模型（只加载一次；失败会抛给调用方走降级） */
-async function getModel(): Promise<unknown> {
-  if (!modelPromise) {
-    modelPromise = (async () => {
-      const mod = await import('@spotify/basic-pitch');
-      return new mod.BasicPitch('/models/basic-pitch/model.json');
-    })();
-  }
-  return modelPromise;
-}
-
 /** 任意采样率的 PCM 重采样到 22050Hz 单声道（basic-pitch 固定用这个采样率） */
-async function resampleTo22050(pcm: Float32Array, sr: number): Promise<AudioBuffer> {
+export async function resampleTo22050(pcm: Float32Array, sr: number): Promise<Float32Array> {
   const target = 22050;
   const len = Math.max(1, Math.ceil((pcm.length * target) / sr));
   const ctx = new OfflineAudioContext(1, len, target);
@@ -48,53 +34,8 @@ async function resampleTo22050(pcm: Float32Array, sr: number): Promise<AudioBuff
   src.buffer = buf;
   src.connect(ctx.destination);
   src.start(0);
-  return ctx.startRendering();
-}
-
-export async function extractMelody(
-  pcm: Float32Array,
-  sr: number,
-  onProgress?: (p: number) => void,
-): Promise<MelodyResult> {
-  try {
-    const resampled = await resampleTo22050(pcm, sr);
-    const mod = await import('@spotify/basic-pitch');
-    const model = (await getModel()) as InstanceType<typeof mod.BasicPitch>;
-
-    const frames: number[][] = [];
-    const onsets: number[][] = [];
-    const contours: number[][] = [];
-    await model.evaluateModel(
-      resampled,
-      (f, o, c) => {
-        frames.push(...f);
-        onsets.push(...o);
-        contours.push(...c);
-      },
-      (p) => onProgress?.(p),
-    );
-
-    // ⚠️ outputToNotesPoly 会原地 mutate 入参 —— 必须传副本，否则重跑拿到空结果
-    const poly = mod.outputToNotesPoly(frames.slice(), onsets.slice(), 0.25, 0.25, 5);
-    const bent = mod.addPitchBendsToNoteEvents(contours.slice(), poly);
-    const timed = mod.noteFramesToTime(bent);
-
-    // NoteEventTime 只有 start/end/pitchMidi；amplitude 挂在原始 NoteEvent 上
-    const notes: MelodyNote[] = timed
-      .filter((n) => Number.isFinite(n.startTimeSeconds) && Number.isFinite(n.pitchMidi))
-      .map((n) => ({
-        start: n.startTimeSeconds,
-        end: n.startTimeSeconds + n.durationSeconds,
-        midi: n.pitchMidi,
-        amplitude: n.amplitude,
-      }));
-
-    if (notes.length === 0) throw new Error('basic-pitch 没有输出音符');
-    return { notes, source: 'basic-pitch' };
-  } catch {
-    // 模型加载失败 / 推理失败（含 Node 里没有 OfflineAudioContext）→ FFT 主峰兜底
-    return { notes: fftMelody(pcm, sr), source: 'fft-fallback' };
-  }
+  const rendered = await ctx.startRendering();
+  return new Float32Array(rendered.getChannelData(0));
 }
 
 /**

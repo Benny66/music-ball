@@ -7,10 +7,10 @@ import {
   Quality,
   StreamTarget,
 } from 'mediabunny';
-import { draw, type Scratch } from '../render/draw.ts';
+import { drawScene, type SceneScratch } from '../render/scene.ts';
+import type { Scene } from '../chart/scene.ts';
 import type { Assets } from '../render/assets.ts';
 import type { Ctx2D, View } from '../render/theme.ts';
-import type { Chart } from '../types.ts';
 
 const AAC_CODEC = 'mp4a.40.2';
 
@@ -145,12 +145,12 @@ export class ExportCancelled extends Error {
 }
 
 export interface ExportOptions {
-  chart: Chart;
+  scene: Scene;
   audioBuffer: AudioBuffer;
   canvas: HTMLCanvasElement;
   view: View;
   assets: Assets;
-  scratch: Scratch;
+  sceneScratch: SceneScratch;
   fps: number;
   videoBitrate: number;
   /** 用来解码探针音频的上下文（必须是固定采样率的离线上下文） */
@@ -215,7 +215,7 @@ export async function exportMp4(o: ExportOptions): Promise<ExportResult> {
   const userOffset = o.timeOffset ?? 0;
   // 音频整体后移了 delay，视频就要显示 t − delay 的画面，两者才重新对齐。
   // 总帧数补上 delay 的长度，避免最后一段只有声音没有画面。
-  const total = Math.max(1, Math.ceil((o.chart.duration + delay) * o.fps));
+  const total = Math.max(1, Math.ceil((o.scene.chart.duration + delay) * o.fps));
 
   for (let i = 0; i < total; i++) {
     if (o.isCancelled()) {
@@ -225,7 +225,7 @@ export async function exportMp4(o: ExportOptions): Promise<ExportResult> {
 
     // 第 i 帧画的就是音频第 i/fps 秒 —— 导出与实时预览共用同一个 draw()
     const t = Math.max(0, i / o.fps - delay + userOffset);
-    draw(ctx as unknown as Ctx2D, o.chart, t, o.view, o.assets, o.scratch);
+    drawScene(ctx as unknown as Ctx2D, o.scene, t, o.view, o.assets, o.sceneScratch);
     await video.add(i / o.fps, 1 / o.fps);
 
     if ((i & 7) === 0) {

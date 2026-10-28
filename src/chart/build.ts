@@ -1,5 +1,6 @@
 import { bakeReflectionXs } from './physics.ts';
 import { boardsFromNotes } from './notes.ts';
+import { activityAt, combineActivity, envelopeP90, longFactorFor, speedFor } from './speed.ts';
 import type { MelodyNote } from '../analysis/melody.ts';
 import { clamp } from '../util/math.ts';
 import { mulberry32 } from '../util/prng.ts';
@@ -159,31 +160,47 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
 
   const segs: Segment[] = [];
   const boards: Board[] = [];
+  const envP90Value = envelopeP90(a);
+  // 长休止会被 splitTooFar 切成 ≤dtMax 的 ghost 段；长段落因子要看「距下一个真实板」的原始间隔
+  const nextRealT = new Float64Array(nodes.length);
+  let nextReal = Infinity;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    nextRealT[i] = nextReal;
+    if (nodes[i].ordinal >= 0) nextReal = nodes[i].t;
+  }
+  let prevSpeed = V;
   let y = 0;
 
   for (let i = 0; i < segCount; i++) {
     const dt = dts[i];
     if (!(dt > 0) || !Number.isFinite(dt)) continue;
-    const dy = V * dt;
 
-    // ---- 板 i 的样式（全部由音乐强弱 w 驱动）----
+    // ---- 逐段速度：BPM 定基准，谱通量 + 音符力度做加减速 ----
     const ordinal = nodes[i].ordinal;
     const barPos = ordinal >= 0 ? (((ordinal - bar.phase) % bar.L) + bar.L) % bar.L : -1;
-    // 小节第一拍额外加成 → 更大更厚、弹得更高、特效更炸
-    const w = clamp(weights[i] + (barPos === 0 ? DOWNBEAT_BOOST : 0), 0, 1);
+    const wBase = clamp(weights[i] + (barPos === 0 ? DOWNBEAT_BOOST : 0), 0, 1);
+    const envAct = activityAt(a, nodes[i].t, nodes[i + 1].t, envP90Value);
+    const activity = combineActivity(envAct, wBase);
+    const gapToNextReal = Number.isFinite(nextRealT[i]) ? nextRealT[i] - nodes[i].t : 0;
+    const rawSpeed = speedFor(V, a.bpm, activity, drama, longFactorFor(gapToNextReal, drama));
+    const speed = i === 0 ? rawSpeed : 0.55 * prevSpeed + 0.45 * rawSpeed;
+    prevSpeed = speed;
+    const dy = speed * dt;
+    // 音频活跃度也参与板宽/厚度/accent/弹跳；speed 的 activity 仍用 wBase，避免重复计入
+    const w = clamp(wBase + drama * 0.25 * (envAct - 0.5), 0, 1);
     const accent = w;
     const halfW = boardHalfW(w);
     const thick = boardThick(accent);
 
     // 倾角顺着球的入射方向。vx = 结点 i 处的横向切线（= 上一段的 m1），
-    // 用 V 而不是 vy 做分母 —— vy 里 g·Δt/2 被伪重力撑到 2V~4V，
+    // 用本段速度而不是 vy 做分母 —— vy 里 g·Δt/2 被伪重力撑到 2V~4V，
     // 用它会算出 1~3° 的倾角，肉眼为零。
     // clamp 必须在乘 drama 之后 —— 之前写成 clamp(...) * drama，实际增益只有
     // 0.7×0.7 = 0.49，p90 顶死在 10.5°，等于白白浪费了三分之一的可用倾角。
     const angle =
       i === 0
         ? 0
-        : clamp(0.75 * drama * Math.atan2(ms[i], V), -BOARD_TILT_MAX, BOARD_TILT_MAX);
+        : clamp(0.75 * drama * Math.atan2(ms[i], speed), -BOARD_TILT_MAX, BOARD_TILT_MAX);
 
     // ---- 本段弹跳高度 → 反解重力 ----
     let kind: BoardKind = kinds[i];
@@ -198,9 +215,9 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
 
     // g 必须由本段的 dt 反解（不能用平滑后的 dt），否则"顶点高度 = h"
     // 和 vy(0) = −√(2gh) 这两条性质都不成立。
-    const a = Math.sqrt(h);
-    const b = Math.sqrt(h + dy);
-    const g = (2 * (a + b) * (a + b)) / (dt * dt);
+    const rootH = Math.sqrt(h);
+    const rootHPlusDy = Math.sqrt(h + dy);
+    const g = (2 * (rootH + rootHPlusDy) * (rootH + rootHPlusDy)) / (dt * dt);
 
     boards.push({
       index: boards.length,
@@ -276,6 +293,8 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
     );
     const accent = lastW;
     const prevMs = ms.length > 0 ? ms[ms.length - 1] : 0;
+    const lastSeg = segs[segs.length - 1];
+    const lastSpeed = lastSeg ? lastSeg.dy / Math.max(1e-9, lastSeg.t1 - lastSeg.t0) : V;
     boards.push({
       index: boards.length,
       t: lastNode.t,
@@ -285,7 +304,7 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
       power: lastNode.power,
       ghost: lastNode.ghost,
       synthetic: lastNode.synthetic,
-      angle: clamp(0.7 * Math.atan2(prevMs, V), -BOARD_TILT_MAX, BOARD_TILT_MAX) * drama,
+      angle: clamp(0.7 * Math.atan2(prevMs, lastSpeed), -BOARD_TILT_MAX, BOARD_TILT_MAX) * drama,
       halfW: boardHalfW(lastW),
       thick: boardThick(accent),
       kind: kinds[kinds.length - 1] ?? 'normal',
@@ -300,15 +319,15 @@ export function buildChart(a: AnalysisResult, opt: BuildOptions = {}): Chart {
   if (segs.length === 0) {
     const dy = V * duration;
     const h = dy / 3;
-    const a = Math.sqrt(h);
-    const b = Math.sqrt(h + dy);
+    const rootH = Math.sqrt(h);
+    const rootHPlusDy = Math.sqrt(h + dy);
     segs.push({
       index: 0,
       t0: 0,
       t1: duration,
       y0: 0,
       dy,
-      g: (2 * (a + b) * (a + b)) / (duration * duration),
+      g: (2 * (rootH + rootHPlusDy) * (rootH + rootHPlusDy)) / (duration * duration),
       h,
       x0: 0,
       x1: 0,
