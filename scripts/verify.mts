@@ -267,6 +267,13 @@ results.push(runCase('8 秒空当前奏 128BPM', 'intro-silence-128.wav', expect
 }
 
 {
+  // 钢琴曲：无鼓、长延音、旋律 + 分解和弦（真值由 make-piano.mts 生成）
+  const pt = JSON.parse(readFileSync(join(DIR, 'piano-90.truth.json'), 'utf8')) as {
+    beats: number[];
+  };
+  results.push(runCase('钢琴曲 90BPM（小星星 + 分解和弦）', 'piano-90.wav', pt.beats));
+}
+{
   const beat = 60 / 150;
   const waltz: number[] = [];
   for (let bar = 0; bar < 40; bar++) {
