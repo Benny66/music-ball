@@ -186,6 +186,12 @@ body {
   cursor: not-allowed;
 }
 
+input:disabled,
+select:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
 .btn.primary {
   background: linear-gradient(180deg, rgba(44, 232, 255, 0.19), rgba(44, 232, 255, 0.1));
   border-color: rgba(44, 232, 255, 0.42);

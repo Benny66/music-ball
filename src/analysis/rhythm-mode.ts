@@ -46,7 +46,7 @@ export function selectRhythmMode(
     return { mode: 'notes', reason: '用户选择音符驱动' };
   }
 
-  if (!melody) return { mode: 'grid', reason: '自动：旋律音符不足' };
+  if (!melody) return { mode: 'grid', reason: '自动：旋律还未提取完成' };
   if (melody.source !== 'basic-pitch') {
     return { mode: 'grid', reason: '旋律模型不可用，已回退节拍驱动' };
   }

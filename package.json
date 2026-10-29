@@ -17,6 +17,7 @@
     "verify:speed": "node --experimental-strip-types scripts/verify-speed.mts",
     "verify:bead": "node --experimental-strip-types scripts/verify-bead.mts",
     "verify:scene": "node --experimental-strip-types scripts/verify-scene.mts",
+    "verify:cache": "node --experimental-strip-types scripts/verify-cache.mts",
     "bead:fixture": "node --experimental-strip-types scripts/bead-fixture.mts",
     "bead:plot": "node --experimental-strip-types scripts/bead-plot.mts",
     "bead:render": "node --experimental-strip-types scripts/render-bead.mts",

@@ -17,10 +17,16 @@ export interface MelodyNote {
   amplitude: number;
 }
 
+export type MelodyBackend = 'webgl' | 'cpu' | 'fallback' | 'cache';
+
 export interface MelodyResult {
   notes: MelodyNote[];
   /** 用的是哪条路径 */
   source: 'basic-pitch' | 'fft-fallback';
+  /** 模型推理后端；FFT 降级为 fallback，缓存命中为 cache */
+  backend?: MelodyBackend;
+  /** WebGL 不可用/推理失败时回退 CPU 的原因 */
+  fallbackReason?: string;
 }
 
 /** 任意采样率的 PCM 重采样到 22050Hz 单声道（basic-pitch 固定用这个采样率） */

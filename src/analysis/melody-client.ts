@@ -1,8 +1,11 @@
-import type { MelodyNote, MelodyResult } from './melody.ts';
+import type { MelodyBackend, MelodyNote, MelodyResult } from './melody.ts';
+
+export type MelodyBackendPref = 'auto' | 'webgl' | 'cpu';
 
 export interface MelodyProgress {
   phase: 'model' | 'infer';
   ratio: number;
+  backend?: MelodyBackend;
 }
 
 export interface MelodyHandle {
@@ -17,6 +20,7 @@ export interface MelodyHandle {
 export function startMelodyInWorker(
   pcm: Float32Array,
   onProgress?: (p: MelodyProgress) => void,
+  opts: { backend?: MelodyBackendPref } = {},
 ): MelodyHandle {
   const worker = new Worker(new URL('./melody.worker.ts', import.meta.url), { type: 'module' });
   let settled = false;
@@ -33,16 +37,31 @@ export function startMelodyInWorker(
 
     worker.onmessage = (ev: MessageEvent) => {
       const msg = ev.data as
-        | { type: 'progress'; phase: 'model' | 'infer'; ratio: number }
-        | { type: 'done'; notes: MelodyNote[]; source: MelodyResult['source']; backend: string }
+        | { type: 'progress'; phase: 'model' | 'infer'; ratio: number; backend?: MelodyBackend }
+        | {
+            type: 'done';
+            notes: MelodyNote[];
+            source: MelodyResult['source'];
+            backend: MelodyBackend;
+            fallbackReason?: string;
+            message?: string;
+          }
         | { type: 'error'; message: string };
 
       if (msg.type === 'progress') {
-        onProgress?.({ phase: msg.phase, ratio: msg.ratio });
+        onProgress?.({ phase: msg.phase, ratio: msg.ratio, backend: msg.backend });
       } else if (msg.type === 'done') {
         settle();
-        console.debug(`[melody] backend=${msg.backend} source=${msg.source} notes=${msg.notes.length}`);
-        resolve({ notes: msg.notes, source: msg.source });
+        console.debug(
+          `[melody] backend=${msg.backend} source=${msg.source} notes=${msg.notes.length}` +
+            (msg.fallbackReason ? ` fallback=${msg.fallbackReason}` : ''),
+        );
+        resolve({
+          notes: msg.notes,
+          source: msg.source,
+          backend: msg.backend,
+          fallbackReason: msg.fallbackReason,
+        });
       } else {
         settle();
         reject(new Error(msg.message));
@@ -54,7 +73,7 @@ export function startMelodyInWorker(
       reject(new Error(e.message || 'melody worker 启动失败'));
     };
 
-    worker.postMessage({ pcm, sampleRate: 22050 }, [pcm.buffer]);
+    worker.postMessage({ pcm, sampleRate: 22050, backend: opts.backend ?? 'auto' }, [pcm.buffer]);
   });
 
   return {

@@ -3,12 +3,22 @@ import { decodeFile, type DecodedAudio } from './audio/decode.ts';
 import { analyzeInWorker } from './analysis/client.ts';
 import { DEFAULT_TRACK_W } from './chart/build.ts';
 import { buildScene, type MotionChoice, type Scene } from './chart/scene.ts';
+import { impactsFromBeats } from './chart/bead.ts';
 import { createAssets, type Assets } from './render/assets.ts';
 import { createSceneScratch, drawScene, type SceneScratch } from './render/scene.ts';
 import { exportMp4, ExportCancelled, webCodecsAvailable } from './export/mp4.ts';
 import { drawWaveform } from './ui/waveform.ts';
-import { fftMelody, resampleTo22050, snapNotesToOnsets, type MelodyResult } from './analysis/melody.ts';
-import { startMelodyInWorker, type MelodyHandle } from './analysis/melody-client.ts';
+import { fftMelody, resampleTo22050, snapNotesToOnsets, type MelodyNote, type MelodyResult } from './analysis/melody.ts';
+import { startMelodyInWorker, type MelodyBackendPref, type MelodyHandle } from './analysis/melody-client.ts';
+import {
+  cacheKey,
+  clearMelodyCache,
+  deleteCachedNotes,
+  getCachedNotes,
+  getCacheStats,
+  hashFile,
+  putCachedNotes,
+} from './analysis/melody-cache.ts';
 import { selectRhythmMode, type RhythmSource } from './analysis/rhythm-mode.ts';
 import {
   mixBuffers,
@@ -80,6 +90,31 @@ let melodyHandle: MelodyHandle | null = null;
 let melodyGen = 0;
 let loadGen = 0;
 let pendingMelodyApply = false;
+/** 当前文件的内容哈希缓存键；缓存不可用/哈希失败时为 null */
+let currentCacheKey: string | null = null;
+
+/** 音符就绪但还没切的升级计划；at 是视觉时间轴上的过渡开始时刻 */
+let pendingUpgrade: { scene: Scene; at: number } | null = null;
+type UpgradeCanvas = ReturnType<MakeCanvas>;
+interface UpgradeTransition {
+  from: Scene;
+  to: Scene;
+  start: number;
+  end: number;
+  fromCanvas: UpgradeCanvas;
+  toCanvas: UpgradeCanvas;
+  fromCtx: Ctx2D;
+  toCtx: Ctx2D;
+  fromScratch: SceneScratch;
+  toScratch: SceneScratch;
+}
+let upgradeTransition: UpgradeTransition | null = null;
+/** 升级后玻璃音轨已过期，但为了不重启播放先不 swap；暂停/seek 时再应用 */
+let pendingGlassRefresh = false;
+/** 提取后端偏好：默认 auto（WebGL 优先、CPU 回退）；可用 ?melodyBackend=cpu 强制 CPU 做对照 */
+const backendParam = new URLSearchParams(location.search).get('melodyBackend');
+let melodyBackendPref: MelodyBackendPref =
+  backendParam === 'cpu' || backendParam === 'webgl' ? backendParam : 'auto';
 const finalCache = new Map<AudioMode, AudioBuffer>();
 /** chart 参数变了（seed/drama/dof）玻璃轨就要重渲；滑杆拖动时用防抖，避免每帧都离线渲染 */
 let glassStale = false;
@@ -118,6 +153,14 @@ function fmtTime(s: number): string {
   return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
+function backendLabel(b: MelodyResult['backend']): string {
+  if (b === 'webgl') return 'WebGL';
+  if (b === 'cpu') return 'CPU';
+  if (b === 'cache') return '缓存';
+  if (b === 'fallback') return 'FFT';
+  return '';
+}
+
 function showLog(msg: string): void {
   const el = $('log');
   el.hidden = false;
@@ -134,14 +177,116 @@ function clearLog(): void {
 
 function renderNow(): void {
   if (!scene) return;
-  drawScene(
-    previewCtx,
-    scene,
-    transport.time + offsetSec - transport.outputCompensation,
-    previewView,
-    previewAssets,
-    previewScratch,
-  );
+  const t = transport.time + offsetSec - transport.outputCompensation;
+
+  if (upgradeTransition) {
+    if (t >= upgradeTransition.end) {
+      finishUpgrade();
+    } else {
+      drawUpgradeTransition(t);
+      return;
+    }
+  } else if (pendingUpgrade && t >= pendingUpgrade.at) {
+    beginUpgradeTransition(t);
+    if (upgradeTransition) {
+      drawUpgradeTransition(t);
+      return;
+    }
+  }
+
+  drawScene(previewCtx, scene, t, previewView, previewAssets, previewScratch);
+}
+
+const UPGRADE_FADE_SEC = 0.26;
+
+function clearUpgrade(): void {
+  pendingUpgrade = null;
+  upgradeTransition = null;
+}
+
+/** 用户手动改了节奏/运动：放弃待处理的音符升级，并让状态行说清楚。 */
+function cancelUpgrade(reason: string): void {
+  if (!pendingUpgrade && !upgradeTransition) return;
+  pendingUpgrade = null;
+  upgradeTransition = null;
+  $('fileMeta').textContent += ` · ${reason}`;
+}
+
+/** 音符就绪后不阻塞播放：在最近撞击点做短交叉过渡切到音符玻璃珠。 */
+function beginUpgradeTransition(t: number): void {
+  const pending = pendingUpgrade;
+  if (!pending || !scene) return;
+  pendingUpgrade = null;
+  if (t >= pending.at + UPGRADE_FADE_SEC) {
+    adoptUpgrade(pending.scene);
+    return;
+  }
+  const fromCanvas = makeCanvas(previewView.w, previewView.h);
+  const toCanvas = makeCanvas(previewView.w, previewView.h);
+  upgradeTransition = {
+    from: scene,
+    to: pending.scene,
+    start: pending.at,
+    end: pending.at + UPGRADE_FADE_SEC,
+    fromCanvas,
+    toCanvas,
+    fromCtx: fromCanvas.getContext('2d') as unknown as Ctx2D,
+    toCtx: toCanvas.getContext('2d') as unknown as Ctx2D,
+    fromScratch: createSceneScratch(),
+    toScratch: createSceneScratch(),
+  };
+}
+
+function drawUpgradeTransition(t: number): void {
+  const tr = upgradeTransition;
+  if (!tr) return;
+  const u = Math.max(0, Math.min(1, (t - tr.start) / (tr.end - tr.start)));
+  const a = u * u * (3 - 2 * u);
+
+  tr.fromCtx.clearRect(0, 0, previewView.w, previewView.h);
+  tr.toCtx.clearRect(0, 0, previewView.w, previewView.h);
+  drawScene(tr.fromCtx, tr.from, t, previewView, previewAssets, tr.fromScratch);
+  drawScene(tr.toCtx, tr.to, t, previewView, previewAssets, tr.toScratch);
+
+  previewCtx.globalAlpha = 1;
+  previewCtx.drawImage(tr.fromCanvas, 0, 0, previewView.w, previewView.h);
+  previewCtx.globalAlpha = a;
+  previewCtx.drawImage(tr.toCanvas, 0, 0, previewView.w, previewView.h);
+  previewCtx.globalAlpha = 1;
+}
+
+function adoptUpgrade(next: Scene): void {
+  scene = next;
+  chart = next.chart;
+  pendingUpgrade = null;
+  upgradeTransition = null;
+  invalidateGlass();
+  if (audioMode !== 'original') pendingGlassRefresh = true;
+  if (analysis) updateRhythm(analysis);
+  else updateMotionUi();
+  $('fileMeta').textContent += ` · 已切到音符玻璃珠（${melodyResult?.notes.length ?? 0} 音）`;
+  dirty = true;
+}
+
+function finishUpgrade(): void {
+  const next = upgradeTransition?.to ?? pendingUpgrade?.scene;
+  upgradeTransition = null;
+  pendingUpgrade = null;
+  if (next) adoptUpgrade(next);
+}
+
+/** 暂停/seek/播完：立刻完成待处理的升级，并补上被推迟的玻璃音轨刷新。 */
+function settlePlayback(): void {
+  if (pendingUpgrade || upgradeTransition) finishUpgrade();
+  if (pendingMelodyApply) {
+    pendingGlassRefresh = false;
+    applyPendingMelody();
+    return;
+  }
+  if (pendingGlassRefresh) {
+    pendingGlassRefresh = false;
+    if (audioMode !== 'original') void applyAudioMode(audioMode);
+  }
 }
 
 let lastSeekSync = 0;
@@ -245,24 +390,57 @@ function updateRhythmUi(): void {
   const note = $('rhythmNote');
   note.textContent = `${isNotes ? '音符驱动' : '节拍网格'} · ${rhythmReason}`;
   note.classList.toggle('warn', /回退|不足|还未|失败/.test(rhythmReason));
-  const density = $<HTMLSelectElement>('density');
-  density.disabled = isNotes;
-  density.title = isNotes ? '音符驱动模式下板子由音符起音决定，密度固定' : '';
-  $('densityNote').textContent = isNotes ? '音符模式固定' : '';
   updateMotionUi();
 }
 
+/**
+ * 运动选择与参数面板。
+ *
+ * 玻璃珠现在是所有歌的默认运动：网格歌用约 1s 抽稀拍点，音符歌用音符起音。
+ * 网格/鼓组不再被强制经典；经典只在手动选择或没有可用撞点时回退。
+ */
 function updateMotionUi(): void {
   const sel = $<HTMLSelectElement>('motion');
   const beadOpt = sel.querySelector<HTMLOptionElement>('option[value="bead"]');
-  const canBead = rhythmEffective === 'notes' && !!chart?.noteDriven;
+  const gridReady = !!analysis && impactsFromBeats(analysis.beats).length >= 2;
+  const canBead = !!chart?.noteDriven || gridReady;
+
   if (beadOpt) beadOpt.disabled = !canBead;
   sel.value = canBead ? motionChoice : 'classic';
-  sel.title = canBead ? '音符驱动默认可选玻璃珠；经典随时可回退' : '网格/鼓组暂用经典运动';
+  sel.title = canBead
+    ? '自动/玻璃珠：音符歌用音符起音，网格歌用约 1s 拍点；经典可随时切'
+    : '没有可用撞点，暂用经典运动';
+
   const note = $('motionNote');
-  if (!canBead) note.textContent = '网格/鼓组暂用经典运动';
-  else note.textContent = scene?.reason ?? '玻璃珠';
-  note.classList.toggle('warn', /回退|失败|暂用/.test(note.textContent ?? ''));
+  note.textContent = scene?.reason ?? (canBead ? '玻璃珠' : '经典运动');
+  note.classList.toggle('warn', /回退|失败|不足|暂用/.test(note.textContent ?? ''));
+
+  const isBead = scene?.motion === 'bead';
+  $('motionClassicNote').hidden = !isBead;
+
+  const speed = $<HTMLInputElement>('speed');
+  const drama = $<HTMLInputElement>('drama');
+  const dofEl = $<HTMLInputElement>('dof');
+  const density = $<HTMLSelectElement>('density');
+  const reseed = $<HTMLButtonElement>('reseed');
+  const beadTitle = '玻璃珠模式固定；切经典可调';
+  for (const el of [speed, drama, dofEl]) {
+    el.disabled = isBead;
+    el.title = isBead ? beadTitle : '';
+  }
+  reseed.disabled = isBead;
+  reseed.title = isBead ? beadTitle : '';
+  const densityFixed = isBead || !!chart?.noteDriven;
+  density.disabled = densityFixed;
+  density.title = isBead
+    ? beadTitle
+    : chart?.noteDriven
+      ? '音符驱动模式下板子由音符起音决定，密度固定'
+      : '';
+  $('densityNote').textContent = densityFixed ? '固定' : '';
+  $('dramaNote').textContent = isBead
+    ? '玻璃珠模式固定；切经典可调'
+    : '0% 恒定速度/统一弹跳 · 100% 最大跟随音乐';
 }
 
 /** 自动判断节奏来源：无鼓组（kick 占比低）且有足够的旋律音符 → 音符驱动 */
@@ -273,11 +451,9 @@ function updateRhythm(res: AnalysisResult): void {
   updateRhythmUi();
 }
 
-function rebuild(): void {
-  if (!analysis) return;
-  const noteSource =
-    rhythmEffective === 'notes' && melodyResult?.source === 'basic-pitch' ? melodyResult.notes : null;
-  scene = buildScene(analysis, {
+function buildSceneFor(noteSource: MelodyNote[] | null): Scene {
+  if (!analysis) throw new Error('还没有分析结果');
+  return buildScene(analysis, {
     V: speedV,
     stride,
     seed,
@@ -286,6 +462,15 @@ function rebuild(): void {
     noteSource,
     motion: motionChoice,
   });
+}
+
+function rebuild(): void {
+  if (!analysis) return;
+  clearUpgrade();
+  pendingGlassRefresh = false;
+  const noteSource =
+    rhythmEffective === 'notes' && melodyResult?.source === 'basic-pitch' ? melodyResult.notes : null;
+  scene = buildSceneFor(noteSource);
   chart = scene.chart;
   $('seedVal').textContent = `#${seed}`;
   // 玻璃轨依赖 chart（声像/衰减/音高），作废并防抖刷新
@@ -301,10 +486,10 @@ function rebuild(): void {
   dirty = true;
 }
 
-function applyAnalysis(res: AnalysisResult): void {
+function applyAnalysis(res: AnalysisResult, opts: { keepMelody?: boolean } = {}): void {
   analysis = res;
-  // 新歌先清掉上一首的旋律，否则第一张图会用旧歌的判定
-  melodyResult = null;
+  // 新歌默认清掉上一首的旋律；缓存命中时调用方已准备好本曲旋律，保留它
+  if (!opts.keepMelody) melodyResult = null;
   glassBuffer = null;
   finalCache.clear();
   updateRhythm(res);
@@ -365,9 +550,17 @@ function applyMelodyChart(res: AnalysisResult, note = ''): void {
   if (!melodyResult) return;
   pendingMelodyApply = false;
   invalidateGlass();
+  const backend = backendLabel(melodyResult.backend);
+  const src =
+    melodyResult.source === 'basic-pitch'
+      ? `模型${backend ? `·${backend}` : ''}`
+      : 'FFT 降级';
+  const fallback = melodyResult.fallbackReason
+    ? ` · ${melodyResult.fallbackReason}`
+    : '';
   $('fileMeta').textContent +=
     note ||
-    ` · 旋律 ${melodyResult.notes.length} 个音（${melodyResult.source === 'basic-pitch' ? '模型' : 'FFT 降级'}）`;
+    ` · 旋律 ${melodyResult.notes.length} 个音（${src}）${fallback}`;
   updateRhythm(res);
   rebuild();
   if (audioMode !== 'original') void applyAudioMode(audioMode);
@@ -394,36 +587,97 @@ function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
 
       const handle = startMelodyInWorker(pcm22, (p) => {
         if (gen !== melodyGen) return;
+        const b = p.backend ? `（${backendLabel(p.backend)}）` : '';
         $('fileMeta').textContent =
-          p.phase === 'model' ? '加载旋律模型…' : `提取旋律 ${(p.ratio * 100).toFixed(0)}% …`;
-      });
+          p.phase === 'model' ? `加载旋律模型…${b}` : `提取旋律 ${(p.ratio * 100).toFixed(0)}%${b} …`;
+      }, { backend: melodyBackendPref });
       melodyHandle = handle;
       const mel = await handle.promise;
       if (gen !== melodyGen) return;
 
       melodyHandle = null;
       cancelBtn.hidden = true;
+      if (mel.source === 'basic-pitch' && currentCacheKey) {
+        const key = currentCacheKey;
+        void putCachedNotes(key, mel.notes).then((ok) => {
+          if (!ok && gen === melodyGen) {
+            console.warn('[melody-cache] 写入失败', key);
+            $('fileMeta').textContent += ' · 旋律缓存写入失败';
+          }
+        });
+      }
       const refined =
         mel.source === 'basic-pitch' ? snapNotesToOnsets(mel.notes, res.onsets ?? []) : mel.notes;
-      const result: MelodyResult = { notes: refined, source: mel.source };
+      const result: MelodyResult = {
+        notes: refined,
+        source: mel.source,
+        backend: mel.backend,
+        fallbackReason: mel.fallbackReason,
+      };
       melodyResult = result;
-      invalidateGlass();
-
       const decision = selectRhythmMode(res, result, rhythmSource);
-      if (rhythmSource === 'auto' && decision.mode === 'notes' && transport.playing) {
+      const playing = transport.playing;
+
+      if (!playing) {
+        applyMelodyChart(res);
+        return;
+      }
+
+      if (decision.mode === 'notes' && motionChoice !== 'classic') {
+        let next: Scene | null = null;
+        try {
+          next = buildSceneFor(result.notes);
+        } catch (err) {
+          console.warn('[upgrade] 音符场景构建失败，改为暂停后应用', err);
+        }
+        if (next && next.motion === 'bead' && next.chart.noteDriven && next.bead) {
+          const nowVisual = transport.time + offsetSec - transport.outputCompensation;
+          const impact = next.bead.impacts.find((x) => x.t >= nowVisual + 0.2);
+          if (impact) {
+            pendingUpgrade = {
+              scene: next,
+              at: Math.max(nowVisual + 0.05, impact.t - UPGRADE_FADE_SEC / 2),
+            };
+            pendingMelodyApply = false;
+            $('fileMeta').textContent +=
+              ` · 音符已就绪（${result.notes.length} 音），即将切到音符玻璃珠`;
+            dirty = true;
+            return;
+          }
+        }
         pendingMelodyApply = true;
         $('fileMeta').textContent +=
-          ` · 音符驱动已就绪（${refined.length} 音），暂停/跳转后应用`;
-        if (audioMode !== 'original') void applyAudioMode(audioMode);
-      } else {
-        applyMelodyChart(res);
+          ` · 音符已就绪（${result.notes.length} 音），暂停/跳转后应用`;
+        return;
       }
+
+      if (decision.mode === 'notes') {
+        // 音符就绪但当前是经典运动：保持旧行为，暂停/seek 再应用，避免播放中跳图
+        pendingMelodyApply = true;
+        $('fileMeta').textContent +=
+          ` · 音符已就绪（${result.notes.length} 音），暂停/跳转后应用（经典运动）`;
+        return;
+      }
+
+      // 网格/鼓组：保持正在播放的拍点玻璃珠，不切图；旋律留给手动音符与玻璃音高
+      invalidateGlass();
+      if (audioMode !== 'original') pendingGlassRefresh = true;
+      updateRhythm(res);
+      $('fileMeta').textContent +=
+        rhythmSource === 'grid'
+          ? ` · 旋律已就绪（${result.notes.length} 音，节拍网格未切换）`
+          : ` · 旋律已就绪（${result.notes.length} 音，自动仍用节拍网格）`;
     } catch (err) {
       if (gen !== melodyGen) return;
       melodyHandle = null;
       cancelBtn.hidden = true;
       const notes = fftMelody(dec.pcm, dec.sr);
-      melodyResult = { notes, source: 'fft-fallback' };
+      melodyResult = {
+        notes,
+        source: 'fft-fallback',
+        backend: 'fallback',
+        fallbackReason: err instanceof Error ? err.message : String(err),
+      };
       invalidateGlass();
       $('fileMeta').textContent += ' · 旋律提取失败，已降级 FFT';
       applyMelodyChart(res);
@@ -447,6 +701,9 @@ async function loadFile(file: File): Promise<void> {
   busy = true;
   const loadToken = ++loadGen;
   resetMelodyWorker();
+  clearUpgrade();
+  pendingGlassRefresh = false;
+  currentCacheKey = null;
   clearLog();
   $('fileName').textContent = file.name;
 
@@ -454,6 +711,15 @@ async function loadFile(file: File): Promise<void> {
     if (!/^audio\//.test(file.type) && !/\.(mp3|wav|m4a|flac|ogg|aac|opus)$/i.test(file.name)) {
       throw new Error('这看起来不是音频文件。请选择 mp3 / wav / m4a。');
     }
+
+    // 缓存查询与解码/分析并行：命中时首次 rebuild 就能用音符玻璃珠
+    const cacheLookup = (async () => {
+      const hash = await hashFile(file);
+      if (!hash) return { key: null as string | null, notes: null };
+      const key = cacheKey(hash);
+      const notes = await getCachedNotes(key);
+      return { key, notes };
+    })();
 
     const t0 = performance.now();
     const dec = await decodeFile(file, decodeCtx);
@@ -487,13 +753,36 @@ async function loadFile(file: File): Promise<void> {
     });
 
     const ms = Math.round(performance.now() - t0);
-    applyAnalysis(res);
-    $('fileMeta').textContent += ` · 分析耗时 ${ms}ms`;
+    const cached = await cacheLookup;
+    if (loadToken !== loadGen) return;
+    if (cached.key) currentCacheKey = cached.key;
+
+    let keepMelody = false;
+    if (cached.key && cached.notes) {
+      const refined = snapNotesToOnsets(cached.notes, res.onsets ?? []);
+      if (refined.length >= 4) {
+        melodyResult = { notes: refined, source: 'basic-pitch', backend: 'cache' };
+        keepMelody = true;
+      } else {
+        // 缓存里的音符在当前分析下几乎全被 onset 精修丢弃，视为失效
+        void deleteCachedNotes(cached.key);
+      }
+    }
+
+    applyAnalysis(res, { keepMelody });
+    $('fileMeta').textContent +=
+      ` · 分析耗时 ${ms}ms` +
+      (keepMelody ? ` · 旋律缓存命中（${melodyResult?.notes.length ?? 0} 音）` : '');
     dirty = true;
 
     // 分析完成后立即释放文件选择；旋律在后台 Worker 继续，可取消/换歌。
     busy = false;
-    startMelodyFor(dec, res);
+    if (keepMelody) {
+      $('melodyCancel').hidden = true;
+      if (audioMode !== 'original') void applyAudioMode(audioMode);
+    } else {
+      startMelodyFor(dec, res);
+    }
   } catch (err) {
     showLog(err instanceof Error ? err.message : String(err));
   } finally {
@@ -505,6 +794,9 @@ async function loadFile(file: File): Promise<void> {
 
 async function runExport(): Promise<void> {
   if (!scene || !decoded || exporting) return;
+
+  // 导出必须使用当前最新场景：如果音符升级还在等待撞击点，先落地再导出
+  if (pendingUpgrade || upgradeTransition) finishUpgrade();
 
   if (!webCodecsAvailable()) {
     showLog('这个浏览器不支持 WebCodecs，无法在本地导出 MP4。\n请使用 Chrome / Edge，或 Safari 26+。');
@@ -628,13 +920,13 @@ $('play').addEventListener('click', () => {
   if (!decoded) return;
   if (transport.playing) {
     transport.pause();
-    applyPendingMelody();
+    settlePlayback();
   } else void transport.play();
 });
 
 transport.onEnded = () => {
   dirty = true;
-  applyPendingMelody();
+  settlePlayback();
   syncTransportUi();
 };
 
@@ -646,7 +938,7 @@ seekEl.addEventListener('input', () => {
   if (!decoded) return;
   transport.seek((Number(seekEl.value) / 1000) * transport.duration);
   dirty = true;
-  applyPendingMelody();
+  settlePlayback();
 });
 seekEl.addEventListener('pointerup', () => {
   scrubbing = false;
@@ -673,6 +965,9 @@ $<HTMLInputElement>('dof').addEventListener('input', (e) => {
 $<HTMLSelectElement>('rhythm').addEventListener('change', (e) => {
   rhythmSource = (e.target as HTMLSelectElement).value as RhythmSource;
   if (!analysis) return;
+  if (pendingUpgrade || upgradeTransition) {
+    cancelUpgrade(rhythmSource === 'notes' ? '已手动切到音符驱动' : '已取消音符升级');
+  }
   if (pendingMelodyApply) {
     if (rhythmSource === 'notes') {
       applyPendingMelody();
@@ -695,6 +990,9 @@ $<HTMLSelectElement>('audioMode').addEventListener('change', (e) => {
 $<HTMLSelectElement>('motion').addEventListener('change', (e) => {
   motionChoice = (e.target as HTMLSelectElement).value as MotionChoice;
   if (!analysis) return;
+  if (pendingUpgrade || upgradeTransition) {
+    cancelUpgrade(motionChoice === 'classic' ? '已取消音符升级（经典运动）' : '已取消音符升级（手动选运动）');
+  }
   rebuild();
 });
 
@@ -728,7 +1026,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (transport.playing) {
       transport.pause();
-      applyPendingMelody();
+      settlePlayback();
     } else void transport.play();
   }
 });
@@ -755,6 +1053,13 @@ const debugApi = {
   get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
   get melodyNotes() { return melodyResult?.notes ?? []; },
   get melodySource() { return melodyResult?.source ?? null; },
+  get melodyBackend() { return melodyResult?.backend ?? null; },
+  get melodyFallbackReason() { return melodyResult?.fallbackReason ?? null; },
+  get melodyBackendPref() { return melodyBackendPref; },
+  setMelodyBackend(v: MelodyBackendPref) { melodyBackendPref = v; },
+  get cacheKey() { return currentCacheKey; },
+  async cacheStats() { return getCacheStats(); },
+  async clearCache() { return clearMelodyCache(); },
   get rhythm() { return rhythmEffective; },
   get rhythmReason() { return rhythmReason; },
   get chart() { return chart; },
@@ -762,11 +1067,24 @@ const debugApi = {
   get motion() { return scene?.motion ?? null; },
   get motionChoice() { return motionChoice; },
   get motionReason() { return scene?.reason ?? ''; },
+  get upgradePending() {
+    return pendingUpgrade
+      ? { at: +pendingUpgrade.at.toFixed(3), impacts: pendingUpgrade.scene.bead?.impacts.length ?? 0 }
+      : null;
+  },
+  get upgradeTransition() {
+    return upgradeTransition
+      ? { start: +upgradeTransition.start.toFixed(3), end: +upgradeTransition.end.toFixed(3) }
+      : null;
+  },
+  get glassRefreshPending() { return pendingGlassRefresh; },
   get bead() { return scene?.bead ?? null; },
   get analysis() { return analysis; },
   get melody() { return melodyResult; },
   get melodyPending() { return pendingMelodyApply; },
   get melodyBusy() { return melodyHandle !== null; },
+  get time() { return +transport.time.toFixed(3); },
+  get playing() { return transport.playing; },
   async loadFromUrl(url: string) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);

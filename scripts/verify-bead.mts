@@ -20,10 +20,12 @@ import {
   evalBeadCamera,
   evalBeadRoll,
   evalBoardEntry,
+  impactsFromBeats,
   impactsFromNotes,
   type BeadImpact,
   type BeadPath,
 } from '../src/chart/bead.ts';
+import type { Band, Beat } from '../src/types.ts';
 
 const tests: Array<[string, () => void]> = [];
 function test(name: string, fn: () => void): void {
@@ -58,6 +60,21 @@ function first(p: BeadPath) {
   return p.impacts[0];
 }
 
+function gridBeats(
+  bpm: number,
+  seconds: number,
+  opts: { power?: (i: number) => number; band?: (i: number) => Band } = {},
+): Beat[] {
+  const period = 60 / bpm;
+  const count = Math.floor(seconds / period);
+  return Array.from({ length: count }, (_, i) => ({
+    t: i * period,
+    power: opts.power?.(i) ?? 0.5,
+    band: opts.band?.(i) ?? 'snare',
+    synthetic: false,
+  }));
+}
+
 test('impactsFromNotes：沿用 boardsFromNotes 的时间/力度/音高，并补时值与左右交替', () => {
   const notes: MelodyNote[] = [
     { start: 0.4, end: 0.9, midi: 64, amplitude: 0.9 },
@@ -75,6 +92,73 @@ test('impactsFromNotes：沿用 boardsFromNotes 的时间/力度/音高，并补
     assert.equal(impacts[i].side, i % 2 === 0 ? -1 : 1);
   }
   assert.ok(impacts[0].dur >= 0.49, `和弦最大时值 ${impacts[0].dur}`);
+});
+
+test('impactsFromBeats：60–180 BPM 按约 1s 抽稀，间隔够滚动+掉落，左右交替', () => {
+  for (const bpm of [60, 90, 120, 140, 180]) {
+    const beats = gridBeats(bpm, 20);
+    const impacts = impactsFromBeats(beats);
+    assert.ok(impacts.length >= 2, `${bpm}bpm 撞击 ${impacts.length}`);
+    const gaps = impacts.slice(1).map((x, i) => x.t - impacts[i].t);
+    for (const g of gaps) assert.ok(g >= 0.9 - 1e-9, `${bpm}bpm 间隔 ${g}`);
+    for (let i = 0; i < impacts.length; i++) {
+      assert.equal(impacts[i].side, i % 2 === 0 ? -1 : 1, `${bpm}bpm 侧别 ${i}`);
+      assert.ok(close(impacts[i].t, beats.find((b) => close(b.t, impacts[i].t))!.t));
+    }
+    const path = buildBeadChoreography(impacts, { duration: 20 });
+    // 最后一块板后面没有下一段，buildBeadChoreography 用 tailDt=0.5 估滚动，
+    // 滚动会被夹到 0.05s；这里只检查有后续撞击的滚动段。
+    for (const s of path.slides.slice(0, -1)) {
+      assert.ok(s.t1 - s.t0 >= 0.45 - 1e-9, `${bpm}bpm 滚动`);
+    }
+    for (const f of path.falls) assert.ok(f.t1 - f.t0 >= 0.45 - 1e-9, `${bpm}bpm 掉落`);
+  }
+});
+
+test('impactsFromBeats：过滤 synthetic，少于 2 个真实拍返回空', () => {
+  const beats: Beat[] = [
+    { t: 0, power: 1, band: 'kick', synthetic: true },
+    { t: 0.5, power: 0.6, band: 'snare', synthetic: false },
+    { t: 1.5, power: 0.6, band: 'snare', synthetic: false },
+    { t: 2.5, power: 0.6, band: 'snare', synthetic: false },
+  ];
+  const impacts = impactsFromBeats(beats);
+  assert.equal(impacts.length, 3);
+  assert.ok(impacts.every((x) => x.t !== 0), 'synthetic 拍点被当成撞击');
+  assert.deepEqual(impactsFromBeats([beats[0], beats[1]]), []);
+  assert.deepEqual(impactsFromBeats([]), []);
+});
+
+test('impactsFromBeats：更近的强拍优先，不被先出现的弱拍占位', () => {
+  const beats: Beat[] = [
+    { t: 0, power: 0.2, band: 'hat', synthetic: false },
+    { t: 0.5, power: 0.95, band: 'kick', synthetic: false },
+    { t: 1.5, power: 0.5, band: 'snare', synthetic: false },
+    { t: 2.5, power: 0.5, band: 'snare', synthetic: false },
+  ];
+  const impacts = impactsFromBeats(beats);
+  assert.equal(impacts[0].t, 0.5);
+  assert.equal(impacts.length, 3);
+});
+
+test('impactsFromBeats：鼓组频段映射到对应音区/颜色，板色与拍点一致', () => {
+  const beats = gridBeats(60, 4, {
+    band: (i) => (['kick', 'snare', 'hat'] as Band[])[i % 3],
+  });
+  const impacts = impactsFromBeats(beats);
+  assert.equal(impacts.length, 4);
+  assert.ok(impacts[0].midi < 67, `kick midi ${impacts[0].midi}`);
+  assert.ok(impacts[1].midi >= 67 && impacts[1].midi < 77, `snare midi ${impacts[1].midi}`);
+  assert.ok(impacts[2].midi >= 77, `hat midi ${impacts[2].midi}`);
+  const path = buildBeadChoreography(impacts, { duration: 4 });
+  assert.deepEqual(
+    path.boards.map((b) => b.band),
+    ['kick', 'snare', 'hat', 'kick'],
+  );
+  for (const x of impacts) {
+    assert.ok(x.power > 0 && x.power <= 1, `power ${x.power}`);
+    assert.ok(x.dur > 0, `dur ${x.dur}`);
+  }
 });
 
 test('impact 时间严格等于输入，100 个撞击无累积漂移', () => {

@@ -1,7 +1,7 @@
 import { boardsFromNotes } from './notes.ts';
-import { BALL_R } from './styles.ts';
+import { BALL_R, BAND_WEIGHT } from './styles.ts';
 import type { MelodyNote } from '../analysis/melody.ts';
-import type { Band } from '../types.ts';
+import type { Band, Beat } from '../types.ts';
 import { clamp } from '../util/math.ts';
 
 /**
@@ -32,6 +32,12 @@ export interface BeadImpact {
 export interface ImpactOptions {
   minGap?: number;
   chordWindow?: number;
+  firstSide?: Side;
+}
+
+export interface BeatImpactOptions {
+  /** 相邻撞击的最短间隔（秒）。玻璃珠完整滚动+掉落需要 >0.9s */
+  minGap?: number;
   firstSide?: Side;
 }
 
@@ -185,6 +191,90 @@ export function impactsFromNotes(notes: MelodyNote[], opts: ImpactOptions = {}):
       power: b.power,
       midi: b.midi ?? 64,
       dur: clamp(dur || 0.1, 0.08, 2),
+      side: (i % 2 === 0 ? firstSide : -firstSide) as Side,
+      band: b.band,
+    };
+  });
+}
+
+const BEAT_DEF = { minGap: 0.9, firstSide: -1 as Side };
+
+/** 拍点强度：响度为主、鼓组权重为辅。只用于抽稀/力度，不改撞击时刻。 */
+function beatStrength(b: Beat): number {
+  const p = Number.isFinite(b.power) ? clamp(b.power, 0, 1) : 0.5;
+  const weight = BAND_WEIGHT[b.band] ?? 0.5;
+  return clamp(0.7 * p + 0.3 * weight, 0, 1);
+}
+
+/**
+ * 拍点 → 音高。玻璃珠的板宽/厚/颜色由 midi 决定，网格驱动没有真实音高，
+ * 用鼓组映射到对应的音区：kick 低、snare 中、hat 高；力度在同一音区内微调宽度。
+ */
+function midiForBand(band: Band, power: number): number {
+  const p = clamp(power, 0, 1);
+  if (band === 'kick') return Math.round(60 + 6 * p);
+  if (band === 'snare') return Math.round(68 + 8 * p);
+  return Math.round(78 + 6 * p);
+}
+
+/**
+ * 网格/鼓组 → 玻璃珠撞击。
+ *
+ * 玻璃珠一次完整「滚动 + 掉落」需要 ~0.9s，所以不能逐拍撞：按约 1s 间隔抽稀，
+ * 在间隔窗口内优先选强拍。撞击时刻严格等于被选中的真实拍点，不含 synthetic 外推拍。
+ */
+export function impactsFromBeats(beats: Beat[], opts: BeatImpactOptions = {}): BeadImpact[] {
+  const minGap = opts.minGap ?? BEAT_DEF.minGap;
+  const firstSide = opts.firstSide ?? BEAT_DEF.firstSide;
+
+  const usable = beats
+    .filter((b) => !b.synthetic && Number.isFinite(b.t) && b.t >= 0)
+    .slice()
+    .sort((a, b) => a.t - b.t);
+
+  // 同一时刻的重复拍只保留更强者，避免 buildBeadChoreography 因严格递增报错
+  const dedup: Beat[] = [];
+  for (const b of usable) {
+    const prev = dedup[dedup.length - 1];
+    if (prev && Math.abs(prev.t - b.t) < 1e-6) {
+      if (beatStrength(b) > beatStrength(prev)) dedup[dedup.length - 1] = b;
+      continue;
+    }
+    dedup.push(b);
+  }
+  if (dedup.length < 2) return [];
+
+  const selected: Beat[] = [];
+  let lastT = -Infinity;
+  let i = 0;
+  while (i < dedup.length) {
+    // 找到下一块「离上次撞击足够远」的拍点；第一块从开头找
+    const minT = lastT === -Infinity ? -Infinity : lastT + minGap;
+    let j = i;
+    while (j < dedup.length && dedup[j].t < minT) j++;
+    if (j >= dedup.length) break;
+
+    // 在「首块 + 很短的前瞻窗口」里挑最强拍：优先强拍，但不为了强拍把间隔拉长到 1.5s。
+    // 第一块给半秒窗口，让开头的弱拍能被紧随其后的强拍替换。
+    const base = dedup[j];
+    const lookAhead = lastT === -Infinity ? 0.5 : 0.2;
+    let best = j;
+    for (let k = j + 1; k < dedup.length && dedup[k].t <= base.t + lookAhead + 1e-9; k++) {
+      if (beatStrength(dedup[k]) > beatStrength(dedup[best]) + 1e-9) best = k;
+    }
+    selected.push(dedup[best]);
+    lastT = dedup[best].t;
+    i = best + 1;
+  }
+  if (selected.length < 2) return [];
+
+  return selected.map((b, i) => {
+    const power = beatStrength(b);
+    return {
+      t: b.t,
+      power,
+      midi: midiForBand(b.band, power),
+      dur: clamp(0.18 + 0.22 * power, 0.15, 0.45),
       side: (i % 2 === 0 ? firstSide : -firstSide) as Side,
       band: b.band,
     };

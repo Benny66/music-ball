@@ -8,6 +8,7 @@
  *   --seconds=12           只渲染前 N 秒
  *   --scale=0.5            渲染分辨率缩放（调试用，快 4 倍）
  *   --audio=glass|mix|original  音轨（默认 glass，与浏览器默认一致）
+ *   --motion=auto|bead|classic  运动（默认：有 --notes 时 auto，否则 classic）
  *   --fps=60
  *
  * 这条路不依赖浏览器，帧精确 100%：第 N 帧画的就是音频第 N/fps 秒。

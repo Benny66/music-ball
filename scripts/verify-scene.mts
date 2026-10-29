@@ -47,18 +47,52 @@ test('音符驱动 + auto → 玻璃珠', () => {
   assert.equal(scene.chart.noteDriven, true);
   assert.equal(scene.bead.impacts.length, 24);
   assert.ok(scene.reason.includes('玻璃珠'));
+  assert.ok(scene.reason.includes('音符'));
 });
 
-test('网格 + auto → 经典；网格 + bead 请求也回退经典', () => {
-  const auto = buildScene(analysis, { noteSource: null, motion: 'auto' });
-  assert.equal(auto.motion, 'classic');
-  assert.equal(auto.bead, null);
-  assert.ok(auto.reason.includes('经典'));
+test('网格 + auto / bead → 拍点玻璃珠', () => {
+  for (const motion of ['auto', 'bead'] as const) {
+    const scene = buildScene(analysis, { noteSource: null, motion });
+    assert.equal(scene.motion, 'bead', motion);
+    assert.ok(scene.bead, motion);
+    assert.equal(scene.chart.noteDriven, false);
+    assert.equal(scene.bead.impacts.length, 30, motion);
+    assert.equal(scene.bead.duration, 30);
+    assert.ok(scene.reason.includes('拍点'), scene.reason);
+    for (let i = 0; i < scene.bead.impacts.length; i++) {
+      assert.equal(scene.bead.impacts[i].side, i % 2 === 0 ? -1 : 1);
+    }
+  }
+});
 
-  const forced = buildScene(analysis, { noteSource: null, motion: 'bead' });
-  assert.equal(forced.motion, 'classic');
-  assert.equal(forced.bead, null);
-  assert.ok(forced.reason.includes('经典'));
+test('网格 + classic → 经典回退', () => {
+  const scene = buildScene(analysis, { noteSource: null, motion: 'classic' });
+  assert.equal(scene.motion, 'classic');
+  assert.equal(scene.bead, null);
+});
+
+test('拍点不足时回退经典并给原因', () => {
+  const empty = { ...analysis, beats: [] };
+  const scene = buildScene(empty, { noteSource: null, motion: 'auto' });
+  assert.equal(scene.motion, 'classic');
+  assert.equal(scene.bead, null);
+  assert.match(scene.reason, /拍点|不足|经典/);
+
+  const one = {
+    ...analysis,
+    beats: [{ t: 1, power: 0.8, band: 'kick' as Band, synthetic: false }],
+  };
+  const single = buildScene(one, { noteSource: null, motion: 'bead' });
+  assert.equal(single.motion, 'classic');
+  assert.equal(single.bead, null);
+});
+
+test('音符不足时仍用拍点玻璃珠，不直接回退经典', () => {
+  const scene = buildScene(analysis, { noteSource: notes.slice(0, 2), motion: 'auto' });
+  assert.equal(scene.chart.noteDriven, false);
+  assert.equal(scene.motion, 'bead');
+  assert.ok(scene.bead);
+  assert.ok(scene.reason.includes('拍点'), scene.reason);
 });
 
 test('音符驱动 + classic → 经典回退', () => {
@@ -90,6 +124,21 @@ test('玻璃珠场景的玻璃音高/力度/声像来自撞击板', () => {
     assert.ok(glass[i].panX >= -1 && glass[i].panX <= 1);
     assert.ok(glass[i].dt >= 0.1 && glass[i].dt <= 1.5);
   }
+});
+
+test('拍点玻璃珠的玻璃音轨来自拍点撞击板', () => {
+  const scene = buildScene(analysis, { noteSource: null, motion: 'auto' });
+  assert.ok(scene.bead);
+  const glass = notesFromBead(scene.bead);
+  assert.equal(glass.length, scene.bead.boards.length);
+  assert.ok(glass.length >= 20);
+  for (let i = 0; i < glass.length; i++) {
+    assert.ok(Math.abs(glass[i].t - scene.bead.boards[i].t) < 1e-9);
+    assert.equal(glass[i].midi, scene.bead.boards[i].midi);
+  }
+  const bands = new Set(scene.bead.boards.map((b) => b.band));
+  assert.ok(bands.has('kick'));
+  assert.ok(bands.has('snare'));
 });
 
 let failed = 0;
