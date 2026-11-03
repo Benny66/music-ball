@@ -36,12 +36,21 @@ export function analyze(
     return emptyResult(sr, duration, flux);
   }
 
+  const highRatio = bandRatio(flux);
+
   opts.onProgress?.('tempo', 0);
   const tempo = estimateTempo(flux.env, flux.hopSec, { hintBpm: opts.hintBpm });
   opts.onProgress?.('tempo', 1);
 
   opts.onProgress?.('beats', 0);
-  const track = trackBeats(flux.env, tempo.periodFrames);
+  // 钢琴/器乐（highRatio 低）没有鼓点做锚，默认的 0.6 规整惩罚会留下 1.25×/1.5×/1.75×
+  // 的拍间隔（真实钢琴实测 18.7% 离开整拍）。提到 1.5 后降到 3.7%，对独立 Essentia
+  // 拍点的 p90 也从 93ms 降到 29ms。鼓组/流行仍走默认值 + 网格正则。
+  const track = trackBeats(
+    flux.env,
+    tempo.periodFrames,
+    highRatio < 0.09 ? { tightness: 1.5 } : {},
+  );
   const minGap = Math.max(2, Math.round(0.12 / flux.hopSec));
   const frames = sanitizeFrames(track.frames, minGap);
   opts.onProgress?.('beats', 0.6);
@@ -90,33 +99,50 @@ export function analyze(
 
   opts.onProgress?.('beats', 1);
 
-  // ---- 网格正则 + 吸附 ----
+  // ---- 网格正则 + 吸附（鼓组/流行）----
   // DP 的毛病不是「找错拍」，而是在正确拍附近 ±25% 乱跳（真实流行歌实测 12%–23% 的间隔
   // 落在 0.75×/1.25×）。先拟合出一条规则网格把这些抖动抹平，再用 ±40ms 的小窗
   // 把网格点拉回真实鼓点 —— 光吸附不拟合网格只会把抖动搬到最近的 onset 上。
-  const low = lowBandOnsets(pcm, sr);
+  //
+  // 钢琴/器乐（highRatio 低）例外：全局锁相会沿着错误的局部周期缓慢漂移。
+  // 实测 168.5s 真实钢琴上 grid 的 median 误差反而比原始 DP 更大
+  // （20–30s 72ms vs 23ms、150–160s 65ms vs 29ms，对照独立 Essentia 拍点）。
+  // 这类歌保留原始 DP 链，交给下游的音符/起音层处理。
   const broadPeaks = pickPeaks(flux.env, flux, { k: 1.0 }).map((p) => ({
     t: p.t,
     strength: p.strength,
   }));
-  const grid = regularizeBeats(detected, low, broadPeaks, {}, (t) => {
-    const idx = Math.round(t / flux.hopSec);
-    let m = 0;
-    for (let i = Math.max(0, idx - 3); i < Math.min(flux.env.length, idx + 4); i++) {
-      if (flux.env[i] > m) m = flux.env[i];
-    }
-    return peak > 0 ? m / peak : 0;
-  });
-  opts.onProgress?.('beats', 1);
 
-  const regularized = grid.beats.length >= 2 ? grid.beats : detected;
+  let regularized: Beat[];
+  let period = 0;
+  let drift = 0;
+  let snapped = 0;
+  if (highRatio >= 0.09) {
+    const low = lowBandOnsets(pcm, sr);
+    const grid = regularizeBeats(detected, low, broadPeaks, {}, (t) => {
+      const idx = Math.round(t / flux.hopSec);
+      let m = 0;
+      for (let i = Math.max(0, idx - 3); i < Math.min(flux.env.length, idx + 4); i++) {
+        if (flux.env[i] > m) m = flux.env[i];
+      }
+      return peak > 0 ? m / peak : 0;
+    });
+    regularized = grid.beats.length >= 2 ? grid.beats : detected;
+    period = grid.period;
+    drift = grid.drift;
+    snapped = grid.snappedRatio;
+  } else {
+    regularized = detected;
+    period = medianGap(detected);
+  }
+
   const beats = extrapolate(
     regularized,
     duration,
-    grid.period > 0 ? grid.period : medianGap(regularized),
+    period > 0 ? period : medianGap(regularized),
   );
 
-  const bpm = grid.period > 0 ? 60 / grid.period : crossCheckBpm(beats, tempo.bpm);
+  const bpm = period > 0 ? 60 / period : crossCheckBpm(beats, tempo.bpm);
 
   // 规律度：拍间隔落在中位 ±15% 内的比例。这是「画面节奏稳不稳」的直接量度，
   // 合成曲 100%，真实曲修复前 52–93%、修复后 97–100%。
@@ -137,11 +163,11 @@ export function analyze(
     hopSec: flux.hopSec,
     quality: {
       regularity,
-      drift: grid.drift,
-      snapped: grid.snappedRatio,
-      period: grid.period,
+      drift,
+      snapped,
+      period,
     },
-    highRatio: bandRatio(flux),
+    highRatio,
     onsets: broadPeaks.map((p) => ({ t: p.t, strength: p.strength })),
   };
 }

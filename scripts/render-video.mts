@@ -6,25 +6,28 @@
  * 选项：
  *   --stills=1.2,3.4,5.6   只出这几秒的 PNG，用于调视觉（不合成视频）
  *   --seconds=12           只渲染前 N 秒
- *   --scale=0.5            渲染分辨率缩放（调试用，快 4 倍）
+ *   --scale=0.5            渲染分辨率缩放（调试用，快 4 倍；同时回到 CRF 17）
  *   --audio=glass|mix|original  音轨（默认 glass，与浏览器默认一致）
  *   --motion=auto|bead|classic  运动（默认：有 --notes 时 auto，否则 classic）
  *   --fps=60
+ *
+ * 不传 --scale 时按分享档自动选 1080×1920@60 / 720×1280@60，并压到 ≤80MB。
  *
  * 这条路不依赖浏览器，帧精确 100%：第 N 帧画的就是音频第 N/fps 秒。
  * 浏览器端的 WebCodecs 导出走的是同一个 drawScene()，所以两边画面一致。
  */
 import { createCanvas } from '@napi-rs/canvas';
-import { writeFileSync, mkdirSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { analyze } from '../src/analysis/pipeline.ts';
 import { fftMelody, type MelodyNote, type MelodyResult } from '../src/analysis/melody.ts';
-import { notesFromBead, notesFromChart } from '../src/audio/glass.ts';
+import { notesFromBead, notesFromChart, notesFromNatural } from '../src/audio/glass.ts';
 import { mixInto, renderGlassTrackNode, resampleLinear, writeWavF32le } from '../src/audio/glass-node.ts';
 import { buildScene, type MotionChoice } from '../src/chart/scene.ts';
+import { shareProfile } from '../src/export/profile.ts';
 import { createAssets } from '../src/render/assets.ts';
 import { createSceneScratch, drawScene } from '../src/render/scene.ts';
 import { DEFAULT_TRACK_W } from '../src/chart/build.ts';
@@ -58,9 +61,6 @@ async function main(): Promise<void> {
   const opt = parseArgs(process.argv.slice(2));
   const input = resolve(args[0] ?? join(ROOT, 'fixtures', 'steady-120.wav'));
   const output = resolve(args[1] ?? join(ROOT, 'out', 'sample.mp4'));
-  const fps = Number(opt.fps ?? 60);
-  const outW = Math.round(1080 * Number(opt.scale ?? 1));
-  const outH = Math.round(outW * (16 / 9));
   const stills = opt.stills ? opt.stills.split(',').map(Number) : null;
   const audioMode = opt.audio ?? 'glass';
   const notes = opt.notes ? loadNotes(resolve(opt.notes)) : null;
@@ -72,6 +72,19 @@ async function main(): Promise<void> {
   const duration = pcm.length / sr;
   console.log(`解码: ${(performance.now() - t0).toFixed(0)}ms  ${duration.toFixed(2)}s  ${sr}Hz`);
 
+  const profile = shareProfile(duration);
+  const debugScale = opt.scale !== undefined;
+  const outW = debugScale ? Math.round(1080 * Number(opt.scale)) : profile.width;
+  const outH = Math.round(outW * (16 / 9));
+  const fps = Number(opt.fps ?? profile.fps);
+  const videoBitrate = debugScale ? undefined : profile.videoBitrate;
+  console.log(
+    `分享档: ${outW}×${outH}@${fps}  ` +
+      (videoBitrate === undefined
+        ? 'CRF 17 调试'
+        : `视频 ${(videoBitrate / 1e6).toFixed(2)}Mbps`),
+  );
+
   const t1 = performance.now();
   const analysis = analyze(pcm, sr, duration);
   console.log(
@@ -82,7 +95,8 @@ async function main(): Promise<void> {
   const scene = buildScene(analysis, { noteSource: notes, motion });
   const chart = scene.chart;
   console.log(
-    `chart: ${chart.boards.length} 板 / ${chart.segs.length} 段 · motion=${scene.motion}${scene.bead ? ` (${scene.bead.impacts.length} 次撞击)` : ''}`,
+    `chart: ${chart.boards.length} 板 / ${chart.segs.length} 段 · motion=${scene.motion}` +
+      ` (${(scene.natural?.impacts.length ?? scene.bead?.impacts.length ?? 0)} 次撞击)`,
   );
 
   const make: MakeCanvas = (w, h) => createCanvas(w, h) as unknown as ReturnType<MakeCanvas>;
@@ -115,9 +129,12 @@ async function main(): Promise<void> {
   // ---- 音轨：与浏览器导出同一套模态合成配方 ----
   let audioFile = input;
   if (audioMode !== 'original') {
-    const glassNotes = scene.bead
-      ? notesFromBead(scene.bead)
-      : notesFromChart(chart, fftMelody(pcm, sr));
+    const glassNotes =
+      scene.motion === 'natural' && scene.natural
+        ? notesFromNatural(scene.natural)
+        : scene.motion === 'bead' && scene.bead
+          ? notesFromBead(scene.bead)
+          : notesFromChart(chart, fftMelody(pcm, sr));
     const glass = renderGlassTrackNode(glassNotes, duration, 0x91a55);
     let track = glass;
     if (audioMode === 'mix') {
@@ -139,6 +156,7 @@ async function main(): Promise<void> {
     height: outH,
     audioFile,
     totalFrames,
+    videoBitrate,
     frame: (i) => {
       drawScene(ctx, scene, i / fps, view, assets, scratch);
       const data = ctx.getImageData(0, 0, outW, outH).data;
@@ -152,6 +170,12 @@ async function main(): Promise<void> {
   const secs = (performance.now() - t2) / 1000;
   console.log(`\n完成: ${output}`);
   console.log(`耗时 ${secs.toFixed(1)}s (${(totalSec / secs).toFixed(2)}× 实时)`);
+
+  const size = statSync(output).size;
+  console.log(`体积: ${(size / 1e6).toFixed(1)}MB`);
+  if (videoBitrate !== undefined && size > 80_000_000) {
+    throw new Error(`分享档超过 80MB: ${(size / 1e6).toFixed(1)}MB`);
+  }
 
   const probe = spawnSync('ffprobe', [
     '-v', 'error', '-select_streams', 'v:0',

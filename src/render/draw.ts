@@ -50,13 +50,15 @@ export function draw(
   view: View,
   assets: Assets,
   scratch: Scratch,
+  lite = false,
+  backdrop = true,
 ): void {
   const { w, h, scale } = view;
   const cy = h * BALL_SCREEN_RATIO;
 
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
-  ctx.drawImage(assets.bg, 0, 0, w, h);
+  if (backdrop) ctx.drawImage(assets.bg, 0, 0, w, h);
 
   const camY = evalCamera(chart, t);
   evalBall(chart, t, scratch.ball);
@@ -77,16 +79,18 @@ export function draw(
   ctx.save();
   ctx.translate(scratch.shakeX, scratch.shakeY);
 
-  drawBoards(ctx, chart, t, view, assets, camY);
-  drawImpacts(ctx, chart, t, view, assets, camY);
-  drawTrail(ctx, chart, t, view, assets, scratch);
+  drawBoards(ctx, chart, t, view, assets, camY, lite);
+  if (!lite) {
+    drawImpacts(ctx, chart, t, view, assets, camY);
+    drawTrail(ctx, chart, t, view, assets, scratch);
+  }
   drawBall(ctx, view, assets, scratch, bx, by, chart);
 
   ctx.restore();
 
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
-  ctx.drawImage(assets.vignette, 0, 0, w, h);
+  if (backdrop) ctx.drawImage(assets.vignette, 0, 0, w, h);
 }
 
 /**
@@ -144,6 +148,7 @@ function drawBoards(
   view: View,
   assets: Assets,
   camY: number,
+  lite: boolean,
 ): void {
   const boards = chart.boards;
   if (boards.length === 0) return;
@@ -185,11 +190,13 @@ function drawBoards(
     // 辉光不进旋转：它本来就是把方形 sprite 非等比拉伸成椭圆，
     // 再套旋转会丢轴对齐快路径、明显发糊，而径向软斑旋不旋转肉眼无差。
     // 竖向按「倾斜后的板子垂直半高」扩张，保证斜板的辉光也盖得住。
-    const halfHWorld = boardHalfH(b.halfW, b.angle, b.thick);
-    const glowH = 2 * (halfHWorld + 34) * scale;
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.globalAlpha = alpha * (0.5 + 1.1 * hit);
-    ctx.drawImage(glow, sx - halfW * 1.5, sy - glowH * 0.5, halfW * 3, glowH);
+    if (!lite) {
+      const halfHWorld = boardHalfH(b.halfW, b.angle, b.thick);
+      const glowH = 2 * (halfHWorld + 34) * scale;
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = alpha * (0.5 + 1.1 * hit);
+      ctx.drawImage(glow, sx - halfW * 1.5, sy - glowH * 0.5, halfW * 3, glowH);
+    }
 
     ctx.save();
     ctx.translate(sx, sy);

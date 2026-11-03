@@ -11,3 +11,4 @@ public/models/
 loaded.png
 *.local
 .workbuddy/
+.wbapp_*.genie

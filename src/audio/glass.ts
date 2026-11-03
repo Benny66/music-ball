@@ -2,6 +2,7 @@ import { clamp } from '../util/math.ts';
 import { hashFloat, mulberry32 } from '../util/prng.ts';
 import type { Chart } from '../types.ts';
 import type { BeadPath } from '../chart/bead.ts';
+import type { NaturalPath } from '../chart/natural.ts';
 import { midiAt, type MelodyNote } from '../analysis/melody.ts';
 import {
   GLASS_AMPS,
@@ -66,11 +67,18 @@ export function notesFromChart(chart: Chart, melody: MelodyNote[] | null): Glass
   return out;
 }
 
-/** 玻璃珠场景：每个撞击一块板，音高/力度/声像都来自该板。 */
-export function notesFromBead(path: BeadPath): GlassNote[] {
-  const half = path.trackW / 2 || 1;
-  return path.boards.map((b, i) => {
-    const next = path.boards[i + 1];
+interface GlassBoard {
+  t: number;
+  midi: number;
+  band: 'kick' | 'snare' | 'hat';
+  power: number;
+  centerX: number;
+}
+
+function notesFromGlassBoards(boards: readonly GlassBoard[], trackW: number): GlassNote[] {
+  const half = trackW / 2 || 1;
+  return boards.map((b, i) => {
+    const next = boards[i + 1];
     return {
       t: b.t,
       midi: b.midi,
@@ -80,6 +88,16 @@ export function notesFromBead(path: BeadPath): GlassNote[] {
       panX: clamp(b.centerX / half, -1, 1),
     };
   });
+}
+
+/** 玻璃珠场景：每个撞击一块板，音高/力度/声像都来自该板。 */
+export function notesFromBead(path: BeadPath): GlassNote[] {
+  return notesFromGlassBoards(path.boards, path.trackW);
+}
+
+/** 自然滚动玻璃珠：撞击板即玻璃声事件。 */
+export function notesFromNatural(path: NaturalPath): GlassNote[] {
+  return notesFromGlassBoards(path.boards, path.trackW);
 }
 
 function makeNoise(ctx: OfflineAudioContext, rng: () => number, seconds: number): AudioBuffer {

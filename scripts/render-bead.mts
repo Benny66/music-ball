@@ -9,13 +9,14 @@
  * 输出在 out/bead/（不入库）。
  */
 import { createCanvas } from '@napi-rs/canvas';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 
 import { analyze } from '../src/analysis/pipeline.ts';
 import type { MelodyNote, MelodyResult } from '../src/analysis/melody.ts';
 import { buildChart, DEFAULT_TRACK_W } from '../src/chart/build.ts';
+import { shareProfile } from '../src/export/profile.ts';
 import { evalBall, evalCamera } from '../src/chart/ball.ts';
 import { createAssets } from '../src/render/assets.ts';
 import { createScratch, draw } from '../src/render/draw.ts';
@@ -52,9 +53,6 @@ const opt = parseArgs(process.argv.slice(2));
 const variant = opt.variant === 'old' ? 'old' : 'new';
 const notesPath = resolve(opt.notes ?? 'out/bead/notes.json');
 const clipPath = resolve(opt.clip ?? 'out/bead/clip.wav');
-const fps = Number(opt.fps ?? 60);
-const outW = Math.round(1080 * Number(opt.scale ?? 1));
-const outH = Math.round(outW * (16 / 9));
 const minGap = Number(opt['min-gap'] ?? 0.7);
 const full = opt.full === '1';
 const stills = opt.stills ? opt.stills.split(',').map(Number) : null;
@@ -75,6 +73,12 @@ if (impacts.length < 2) throw new Error(`撞击点不足: ${impacts.length}`);
 
 const { pcm, sr } = decodeAudioFile(clipPath);
 const clipDuration = pcm.length / sr;
+const profile = shareProfile(clipDuration);
+const debugScale = opt.scale !== undefined;
+const fps = Number(opt.fps ?? profile.fps);
+const outW = debugScale ? Math.round(1080 * Number(opt.scale)) : profile.width;
+const outH = Math.round(outW * (16 / 9));
+const videoBitrate = debugScale ? undefined : profile.videoBitrate;
 const path = buildBeadChoreography(impacts, { duration: clipDuration });
 
 const totalSec = full ? clipDuration : Math.min(clipDuration, Number(opt.seconds ?? 8));
@@ -89,7 +93,10 @@ const make: MakeCanvas = (w, h) => createCanvas(w, h) as unknown as ReturnType<M
 const assets = createAssets(make, view);
 
 console.log(`variant=${variant}  ${totalSec.toFixed(2)}s @ ${outW}x${outH} ${fps}fps`);
-console.log(`notes=${notes.length} impacts=${impacts.length} minGap=${minGap}s`);
+console.log(
+  `notes=${notes.length} impacts=${impacts.length} minGap=${minGap}s  ` +
+    (videoBitrate === undefined ? 'CRF 17 调试' : `分享档 ${(videoBitrate / 1e6).toFixed(2)}Mbps`),
+);
 
 if (variant === 'new') {
   preflightNew(path, view, totalSec, fps);
@@ -140,6 +147,7 @@ async function renderNew(
     height: outH,
     audioFile: clipPath,
     totalFrames: frames,
+    videoBitrate,
     frame: (i) => {
       drawBead(ctx, pathIn, i / fps, view, assets, scratch);
       const data = ctx.getImageData(0, 0, outW, outH).data;
@@ -181,6 +189,7 @@ async function renderOld(
     height: outH,
     audioFile: clipPath,
     totalFrames: frames,
+    videoBitrate,
     frame: (i) => {
       draw(ctx, chart, i / fps, view, assets, scratch);
       const data = ctx.getImageData(0, 0, outW, outH).data;
@@ -250,6 +259,11 @@ function preflightOld(chart: Chart, v: View, seconds: number, rate: number): voi
 
 function report(out: string, seconds: number): void {
   console.log(`\n完成: ${out}  (${seconds.toFixed(2)}s)`);
+  const size = statSync(out).size;
+  console.log(`体积: ${(size / 1e6).toFixed(1)}MB`);
+  if (videoBitrate !== undefined && size > 80_000_000) {
+    throw new Error(`分享档超过 80MB: ${(size / 1e6).toFixed(1)}MB`);
+  }
   const probe = spawnSync('ffprobe', [
     '-v', 'error',
     '-select_streams', 'v:0',

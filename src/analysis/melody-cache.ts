@@ -18,7 +18,7 @@ const MAX_BYTES = 30 * 1024 * 1024;
 /** 缓存结构或模型变化时递增，旧键自然失效。 */
 export const CACHE_VERSION = 1;
 /** 模型版本 + outputToNotesPoly 参数；任一项变化都应让旧音符失效。 */
-export const MODEL_VERSION = 'basic-pitch-1.0.1:poly-0.25-0.25-5';
+export const MODEL_VERSION = 'basic-pitch-1.0.1:poly-0.25-0.25-5:fast-melodia';
 
 interface CacheEntry {
   key: string;

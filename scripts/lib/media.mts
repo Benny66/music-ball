@@ -59,6 +59,11 @@ export interface EncodeFramesOptions {
   audioFile: string;
   totalFrames: number;
   /**
+   * 分享档目标码率（bps）。设置后用 CRF 20 + VBV 上限压住体积；
+   * 不设置则保留 CRF 17 的调试/验收画质。
+   */
+  videoBitrate?: number;
+  /**
    * 返回一整帧 RGBA 像素（width*height*4）。
    * 调用方负责画帧；模块只负责 ffmpeg 背压、错误与退出码。
    */
@@ -68,8 +73,18 @@ export interface EncodeFramesOptions {
 
 /** 逐帧喂给 ffmpeg，封装成 H.264 + AAC 的 mp4。 */
 export async function encodeFramesToMp4(opts: EncodeFramesOptions): Promise<void> {
-  const { output, fps, width, height, audioFile, totalFrames, frame, onProgress } = opts;
+  const { output, fps, width, height, audioFile, totalFrames, videoBitrate, frame, onProgress } =
+    opts;
   const expected = width * height * 4;
+
+  const rateControl =
+    videoBitrate === undefined
+      ? ['-crf', '17']
+      : [
+          '-crf', '20',
+          '-maxrate', String(Math.round(videoBitrate)),
+          '-bufsize', String(Math.round(videoBitrate * 2)),
+        ];
 
   const ff = spawn('ffmpeg', [
     '-y',
@@ -84,7 +99,7 @@ export async function encodeFramesToMp4(opts: EncodeFramesOptions): Promise<void
     '-map', '1:a:0',
     '-c:v', 'libx264',
     '-preset', 'medium',
-    '-crf', '17',
+    ...rateControl,
     '-pix_fmt', 'yuv420p',
     '-profile:v', 'high',
     '-c:a', 'aac',

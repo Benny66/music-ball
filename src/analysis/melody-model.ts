@@ -1,9 +1,9 @@
 import {
   BasicPitch,
-  outputToNotesPoly,
   addPitchBendsToNoteEvents,
   noteFramesToTime,
 } from '@spotify/basic-pitch';
+import { outputToNotesPolyFast } from './basic-pitch-notes.ts';
 import type { MelodyNote, MelodyResult } from './melody.ts';
 
 /**
@@ -41,8 +41,10 @@ export async function runBasicPitch(
     (p) => onProgress?.(p),
   );
 
-  // ⚠️ outputToNotesPoly 会原地 mutate 入参 —— 必须传副本，否则重跑拿到空结果
-  const poly = outputToNotesPoly(frames.slice(), onsets.slice(), 0.25, 0.25, 5);
+  // ⚠️ outputToNotesPoly 会原地 mutate 入参 —— 必须传副本，否则重跑拿到空结果。
+  // 本地快速版保留原库的 Melodia 补充搜索，只把「每轮全矩阵找最大值」换成行最大值堆；
+  // 168.5s 真实钢琴原版后处理 5.4s，快速版约 1.1s（高负载机器），音符逐条一致（verify:melodia）。
+  const poly = outputToNotesPolyFast(frames.slice(), onsets.slice(), 0.25, 0.25, 5);
   const bent = addPitchBendsToNoteEvents(contours.slice(), poly);
   const timed = noteFramesToTime(bent);
 

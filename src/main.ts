@@ -7,6 +7,7 @@ import { impactsFromBeats } from './chart/bead.ts';
 import { createAssets, type Assets } from './render/assets.ts';
 import { createSceneScratch, drawScene, type SceneScratch } from './render/scene.ts';
 import { exportMp4, ExportCancelled, webCodecsAvailable } from './export/mp4.ts';
+import { shareProfile } from './export/profile.ts';
 import { drawWaveform } from './ui/waveform.ts';
 import { fftMelody, resampleTo22050, snapNotesToOnsets, type MelodyNote, type MelodyResult } from './analysis/melody.ts';
 import { startMelodyInWorker, type MelodyBackendPref, type MelodyHandle } from './analysis/melody-client.ts';
@@ -24,6 +25,7 @@ import {
   mixBuffers,
   notesFromBead,
   notesFromChart,
+  notesFromNatural,
   renderGlassTrack,
   resampleTo48k,
   rmsOf,
@@ -40,10 +42,6 @@ const $ = <T extends HTMLElement>(id: string): T => {
 
 const PREVIEW_W = 720;
 const VIEW_H = 1600;
-const EXPORT_W = 1080;
-const EXPORT_H = 1920;
-const FPS = 60;
-const VIDEO_BITRATE = 10_000_000;
 
 // ---------- 状态 ----------
 
@@ -144,6 +142,35 @@ viewCanvas.height = previewView.h;
 const previewAssets: Assets = createAssets(makeCanvas, previewView);
 const previewScratch: SceneScratch = createSceneScratch();
 
+// 背景/暗角是静态层：只在启动时画一次，动态画布每帧只画球/板/特效。
+const stageBackdrop = $<HTMLCanvasElement>('stageBackdrop');
+const stageBackdropCtx = stageBackdrop.getContext('2d') as unknown as Ctx2D;
+stageBackdropCtx.drawImage(previewAssets.bg, 0, 0, previewView.w, previewView.h);
+const stageVignette = $<HTMLCanvasElement>('stageVignette');
+const stageVignetteCtx = stageVignette.getContext('2d') as unknown as Ctx2D;
+stageVignetteCtx.drawImage(previewAssets.vignette, 0, 0, previewView.w, previewView.h);
+
+/** 提取旋律期间固定降级：0.75× 内部分辨率 + 跳过尾迹/板外辉光，提取结束立即恢复 */
+const PREVIEW_LITE_SCALE = 0.75;
+const previewLiteView: View = {
+  w: Math.round(PREVIEW_W * PREVIEW_LITE_SCALE),
+  h: Math.round(previewView.h * PREVIEW_LITE_SCALE),
+  scale: (PREVIEW_W * PREVIEW_LITE_SCALE) / DEFAULT_TRACK_W,
+};
+let previewLite = false;
+let previewLiteAssets: Assets | null = null;
+
+function syncPreviewQuality(): void {
+  const wantLite = melodyHandle !== null;
+  if (wantLite === previewLite) return;
+  previewLite = wantLite;
+  const v = wantLite ? previewLiteView : previewView;
+  viewCanvas.width = v.w;
+  viewCanvas.height = v.h;
+  if (wantLite && !previewLiteAssets) previewLiteAssets = createAssets(makeCanvas, v);
+  dirty = true;
+}
+
 // ---------- 工具 ----------
 
 function fmtTime(s: number): string {
@@ -177,6 +204,7 @@ function clearLog(): void {
 
 function renderNow(): void {
   if (!scene) return;
+  syncPreviewQuality();
   const t = transport.time + offsetSec - transport.outputCompensation;
 
   if (upgradeTransition) {
@@ -194,7 +222,16 @@ function renderNow(): void {
     }
   }
 
-  drawScene(previewCtx, scene, t, previewView, previewAssets, previewScratch);
+  drawScene(
+    previewCtx,
+    scene,
+    t,
+    previewLite ? previewLiteView : previewView,
+    previewLite ? previewLiteAssets ?? previewAssets : previewAssets,
+    previewScratch,
+    previewLite ? 'lite' : 'full',
+    false,
+  );
 }
 
 const UPGRADE_FADE_SEC = 0.26;
@@ -245,9 +282,10 @@ function drawUpgradeTransition(t: number): void {
 
   tr.fromCtx.clearRect(0, 0, previewView.w, previewView.h);
   tr.toCtx.clearRect(0, 0, previewView.w, previewView.h);
-  drawScene(tr.fromCtx, tr.from, t, previewView, previewAssets, tr.fromScratch);
-  drawScene(tr.toCtx, tr.to, t, previewView, previewAssets, tr.toScratch);
+  drawScene(tr.fromCtx, tr.from, t, previewView, previewAssets, tr.fromScratch, 'full', false);
+  drawScene(tr.toCtx, tr.to, t, previewView, previewAssets, tr.toScratch, 'full', false);
 
+  previewCtx.clearRect(0, 0, previewView.w, previewView.h);
   previewCtx.globalAlpha = 1;
   previewCtx.drawImage(tr.fromCanvas, 0, 0, previewView.w, previewView.h);
   previewCtx.globalAlpha = a;
@@ -320,6 +358,7 @@ function syncTransportUi(): void {
 // ---------- 建图 ----------
 
 function buildGlassNotes(): GlassNote[] {
+  if (scene?.motion === 'natural' && scene.natural) return notesFromNatural(scene.natural);
   if (scene?.motion === 'bead' && scene.bead) return notesFromBead(scene.bead);
   if (!chart) return [];
   return notesFromChart(chart, melodyResult?.notes ?? null);
@@ -415,8 +454,8 @@ function updateMotionUi(): void {
   note.textContent = scene?.reason ?? (canBead ? '玻璃珠' : '经典运动');
   note.classList.toggle('warn', /回退|失败|不足|暂用/.test(note.textContent ?? ''));
 
-  const isBead = scene?.motion === 'bead';
-  $('motionClassicNote').hidden = !isBead;
+  const isGlass = scene?.motion === 'natural' || scene?.motion === 'bead';
+  $('motionClassicNote').hidden = !isGlass;
 
   const speed = $<HTMLInputElement>('speed');
   const drama = $<HTMLInputElement>('drama');
@@ -425,20 +464,20 @@ function updateMotionUi(): void {
   const reseed = $<HTMLButtonElement>('reseed');
   const beadTitle = '玻璃珠模式固定；切经典可调';
   for (const el of [speed, drama, dofEl]) {
-    el.disabled = isBead;
-    el.title = isBead ? beadTitle : '';
+    el.disabled = isGlass;
+    el.title = isGlass ? beadTitle : '';
   }
-  reseed.disabled = isBead;
-  reseed.title = isBead ? beadTitle : '';
-  const densityFixed = isBead || !!chart?.noteDriven;
+  reseed.disabled = isGlass;
+  reseed.title = isGlass ? beadTitle : '';
+  const densityFixed = isGlass || !!chart?.noteDriven;
   density.disabled = densityFixed;
-  density.title = isBead
+  density.title = isGlass
     ? beadTitle
     : chart?.noteDriven
       ? '音符驱动模式下板子由音符起音决定，密度固定'
       : '';
   $('densityNote').textContent = densityFixed ? '固定' : '';
-  $('dramaNote').textContent = isBead
+  $('dramaNote').textContent = isGlass
     ? '玻璃珠模式固定；切经典可调'
     : '0% 恒定速度/统一弹跳 · 100% 最大跟随音乐';
 }
@@ -472,6 +511,7 @@ function rebuild(): void {
     rhythmEffective === 'notes' && melodyResult?.source === 'basic-pitch' ? melodyResult.notes : null;
   scene = buildSceneFor(noteSource);
   chart = scene.chart;
+  $('stage').classList.add('has-scene');
   $('seedVal').textContent = `#${seed}`;
   // 玻璃轨依赖 chart（声像/衰减/音高），作废并防抖刷新
   glassStale = true;
@@ -484,6 +524,14 @@ function rebuild(): void {
   }, 450);
   updateMotionUi();
   dirty = true;
+}
+
+function updateExportProfile(): void {
+  if (!scene) return;
+  const p = shareProfile(scene.chart.duration);
+  $<HTMLButtonElement>('exportBtn').textContent = `导出 MP4 · ${p.width}×${p.height}`;
+  const mb = Math.round(((p.videoBitrate + p.audioBitrate) / 8) * scene.chart.duration / 1e6);
+  $('exportHint').textContent = `导出在本地完成，不上传任何数据 · 预计 ${mb}MB`;
 }
 
 function applyAnalysis(res: AnalysisResult, opts: { keepMelody?: boolean } = {}): void {
@@ -524,6 +572,7 @@ function applyAnalysis(res: AnalysisResult, opts: { keepMelody?: boolean } = {})
   $('transport').hidden = false;
   $('params').hidden = false;
   $('exportBox').hidden = false;
+  updateExportProfile();
   $('empty').hidden = true;
   const badge = $('badge');
   badge.hidden = false;
@@ -532,10 +581,17 @@ function applyAnalysis(res: AnalysisResult, opts: { keepMelody?: boolean } = {})
 
 // ---------- 加载 ----------
 
+function clearLiteStatus(): void {
+  const el = $('fileMeta');
+  el.textContent = (el.textContent ?? '').replace(/ · 预览降级中/g, '');
+}
+
 function resetMelodyWorker(): void {
   melodyGen++;
   melodyHandle?.cancel();
   melodyHandle = null;
+  clearLiteStatus();
+  syncPreviewQuality();
   pendingMelodyApply = false;
   $('melodyCancel').hidden = true;
 }
@@ -578,7 +634,7 @@ function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
   pendingMelodyApply = false;
   const cancelBtn = $<HTMLButtonElement>('melodyCancel');
   cancelBtn.hidden = false;
-  $('fileMeta').textContent += ' · 加载旋律模型…';
+  $('fileMeta').textContent += ' · 加载旋律模型… · 预览降级中';
 
   void (async () => {
     try {
@@ -589,13 +645,18 @@ function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
         if (gen !== melodyGen) return;
         const b = p.backend ? `（${backendLabel(p.backend)}）` : '';
         $('fileMeta').textContent =
-          p.phase === 'model' ? `加载旋律模型…${b}` : `提取旋律 ${(p.ratio * 100).toFixed(0)}%${b} …`;
+          (p.phase === 'model'
+            ? `加载旋律模型…${b}`
+            : `提取旋律 ${(p.ratio * 100).toFixed(0)}%${b} …`) + ' · 预览降级中';
       }, { backend: melodyBackendPref });
       melodyHandle = handle;
+      syncPreviewQuality();
       const mel = await handle.promise;
       if (gen !== melodyGen) return;
 
       melodyHandle = null;
+      clearLiteStatus();
+      syncPreviewQuality();
       cancelBtn.hidden = true;
       if (mel.source === 'basic-pitch' && currentCacheKey) {
         const key = currentCacheKey;
@@ -630,9 +691,11 @@ function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
         } catch (err) {
           console.warn('[upgrade] 音符场景构建失败，改为暂停后应用', err);
         }
-        if (next && next.motion === 'bead' && next.chart.noteDriven && next.bead) {
+        const nextImpacts =
+          next?.motion === 'natural' ? next.natural?.impacts : next?.motion === 'bead' ? next.bead?.impacts : null;
+        if (next && nextImpacts && next.chart.noteDriven) {
           const nowVisual = transport.time + offsetSec - transport.outputCompensation;
-          const impact = next.bead.impacts.find((x) => x.t >= nowVisual + 0.2);
+          const impact = nextImpacts.find((x) => x.t >= nowVisual + 0.2);
           if (impact) {
             pendingUpgrade = {
               scene: next,
@@ -670,6 +733,8 @@ function startMelodyFor(dec: DecodedAudio, res: AnalysisResult): void {
     } catch (err) {
       if (gen !== melodyGen) return;
       melodyHandle = null;
+      clearLiteStatus();
+      syncPreviewQuality();
       cancelBtn.hidden = true;
       const notes = fftMelody(dec.pcm, dec.sr);
       melodyResult = {
@@ -837,11 +902,16 @@ async function runExport(): Promise<void> {
       }
     }
 
-    // 导出画布用 1080×1920 单独渲染，与预览共用同一个 draw()
+    // 分享档按曲长选 1080p60 / 720p60，与预览共用同一个 draw()
+    const profile = shareProfile(scene.chart.duration);
     const canvas = document.createElement('canvas');
-    canvas.width = EXPORT_W;
-    canvas.height = EXPORT_H;
-    const exportView: View = { w: EXPORT_W, h: EXPORT_H, scale: EXPORT_W / DEFAULT_TRACK_W };
+    canvas.width = profile.width;
+    canvas.height = profile.height;
+    const exportView: View = {
+      w: profile.width,
+      h: profile.height,
+      scale: profile.width / DEFAULT_TRACK_W,
+    };
     const exportAssets = createAssets(makeCanvas, exportView);
 
     const t0 = performance.now();
@@ -852,8 +922,8 @@ async function runExport(): Promise<void> {
       view: exportView,
       assets: exportAssets,
       sceneScratch: createSceneScratch(),
-      fps: FPS,
-      videoBitrate: VIDEO_BITRATE,
+      fps: profile.fps,
+      videoBitrate: profile.videoBitrate,
       probeCtx: decodeCtx,
       timeOffset: exportOffsetSec,
       writable,
@@ -874,7 +944,7 @@ async function runExport(): Promise<void> {
 
     setProgress(
       1,
-      `完成 · ${(result.frames / FPS).toFixed(1)}s / ${result.frames} 帧 · 耗时 ${secs.toFixed(1)}s · ` +
+      `完成 · ${(result.frames / profile.fps).toFixed(1)}s / ${result.frames} 帧 · 耗时 ${secs.toFixed(1)}s · ` +
         `已补偿音频延迟 ${Math.round(result.audioDelay * 1000)}ms`,
     );
   } catch (err) {
@@ -1049,6 +1119,8 @@ const debugApi = {
   },
   get glassRms() { return glassBuffer ? +rmsOf(glassBuffer).toFixed(3) : 0; },
   get glassStale() { return glassStale; },
+  get previewLite() { return previewLite; },
+  get previewCanvas() { return { w: viewCanvas.width, h: viewCanvas.height }; },
   get glassNoteCount() { return buildGlassNotes().length; },
   get decodedSr() { return decoded?.buffer.sampleRate ?? 0; },
   get melodyNotes() { return melodyResult?.notes ?? []; },
@@ -1064,12 +1136,19 @@ const debugApi = {
   get rhythmReason() { return rhythmReason; },
   get chart() { return chart; },
   get scene() { return scene; },
+  get exportProfile() { return scene ? shareProfile(scene.chart.duration) : null; },
   get motion() { return scene?.motion ?? null; },
   get motionChoice() { return motionChoice; },
   get motionReason() { return scene?.reason ?? ''; },
   get upgradePending() {
     return pendingUpgrade
-      ? { at: +pendingUpgrade.at.toFixed(3), impacts: pendingUpgrade.scene.bead?.impacts.length ?? 0 }
+      ? {
+          at: +pendingUpgrade.at.toFixed(3),
+          impacts:
+            pendingUpgrade.scene.natural?.impacts.length ??
+            pendingUpgrade.scene.bead?.impacts.length ??
+            0,
+        }
       : null;
   },
   get upgradeTransition() {
@@ -1079,6 +1158,7 @@ const debugApi = {
   },
   get glassRefreshPending() { return pendingGlassRefresh; },
   get bead() { return scene?.bead ?? null; },
+  get natural() { return scene?.natural ?? null; },
   get analysis() { return analysis; },
   get melody() { return melodyResult; },
   get melodyPending() { return pendingMelodyApply; },

@@ -6,8 +6,9 @@
 import assert from 'node:assert/strict';
 
 import { buildScene } from '../src/chart/scene.ts';
-import type { BeadBoard } from '../src/chart/bead.ts';
-import { notesFromBead } from '../src/audio/glass.ts';
+import type { NaturalBoard } from '../src/chart/natural.ts';
+import { boardsFromNotes } from '../src/chart/notes.ts';
+import { notesFromBead, notesFromNatural } from '../src/audio/glass.ts';
 import type { AnalysisResult, Band, Beat } from '../src/types.ts';
 import type { MelodyNote } from '../src/analysis/melody.ts';
 
@@ -40,14 +41,27 @@ function test(name: string, fn: () => void): void {
   tests.push([name, fn]);
 }
 
-test('音符驱动 + auto → 玻璃珠', () => {
+test('音符驱动 + auto → 表面节奏自然滚动', () => {
   const scene = buildScene(analysis, { noteSource: notes, motion: 'auto' });
-  assert.equal(scene.motion, 'bead');
-  assert.ok(scene.bead);
+  assert.equal(scene.motion, 'natural');
+  assert.ok(scene.natural);
+  assert.equal(scene.bead, null);
   assert.equal(scene.chart.noteDriven, true);
-  assert.equal(scene.bead.impacts.length, 24);
+  assert.equal(scene.natural.impacts.length, 24);
   assert.ok(scene.reason.includes('玻璃珠'));
-  assert.ok(scene.reason.includes('音符'));
+  assert.ok(scene.reason.includes('表面节奏'));
+});
+
+test('自然滚动的撞击时刻全部来自音符板起音', () => {
+  const scene = buildScene(analysis, { noteSource: notes, motion: 'bead' });
+  const boardTimes = boardsFromNotes(notes, { minGap: 0.125 }).map((b) => b.t);
+  assert.ok(scene.natural);
+  for (const impact of scene.natural.impacts) {
+    assert.ok(
+      boardTimes.some((t) => Math.abs(t - impact.t) < 1e-9),
+      `${impact.t} 不在音符板上`,
+    );
+  }
 });
 
 test('网格 + auto / bead → 拍点玻璃珠', () => {
@@ -69,6 +83,7 @@ test('网格 + classic → 经典回退', () => {
   const scene = buildScene(analysis, { noteSource: null, motion: 'classic' });
   assert.equal(scene.motion, 'classic');
   assert.equal(scene.bead, null);
+  assert.equal(scene.natural, null);
 });
 
 test('拍点不足时回退经典并给原因', () => {
@@ -85,6 +100,7 @@ test('拍点不足时回退经典并给原因', () => {
   const single = buildScene(one, { noteSource: null, motion: 'bead' });
   assert.equal(single.motion, 'classic');
   assert.equal(single.bead, null);
+  assert.equal(single.natural, null);
 });
 
 test('音符不足时仍用拍点玻璃珠，不直接回退经典', () => {
@@ -99,25 +115,27 @@ test('音符驱动 + classic → 经典回退', () => {
   const scene = buildScene(analysis, { noteSource: notes, motion: 'classic' });
   assert.equal(scene.motion, 'classic');
   assert.equal(scene.bead, null);
+  assert.equal(scene.natural, null);
   assert.equal(scene.chart.noteDriven, true);
 });
 
 test('玻璃珠路径覆盖整曲时长，同输入确定', () => {
   const a = buildScene(analysis, { noteSource: notes, motion: 'bead' });
   const b = buildScene(analysis, { noteSource: notes, motion: 'bead' });
-  assert.equal(a.bead?.duration, 30);
-  assert.deepEqual(a, b);
+  assert.equal(a.natural?.duration, 30);
+  assert.deepEqual(a.natural?.boards, b.natural?.boards);
+  assert.deepEqual(a.natural?.impacts, b.natural?.impacts);
 });
 
 
-test('玻璃珠场景的玻璃音高/力度/声像来自撞击板', () => {
+test('自然滚动的玻璃音高/力度/声像来自撞击板', () => {
   const scene = buildScene(analysis, { noteSource: notes, motion: 'bead' });
-  const bead = scene.bead;
-  assert.ok(bead);
-  const glass = notesFromBead(bead);
-  assert.equal(glass.length, bead.boards.length);
+  const natural = scene.natural;
+  assert.ok(natural);
+  const glass = notesFromNatural(natural);
+  assert.equal(glass.length, natural.boards.length);
   for (let i = 0; i < glass.length; i++) {
-    const b: BeadBoard = bead.boards[i];
+    const b: NaturalBoard = natural.boards[i];
     assert.ok(Math.abs(glass[i].t - b.t) < 1e-9);
     assert.equal(glass[i].midi, b.midi);
     assert.ok(Math.abs(glass[i].accent - b.power) < 1e-9);

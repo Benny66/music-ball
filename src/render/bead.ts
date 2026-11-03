@@ -59,21 +59,23 @@ export function drawBead(
   view: View,
   assets: Assets,
   scratch: BeadScratch = createBeadScratch(),
+  lite = false,
+  backdrop = true,
 ): void {
   const camY = evalBeadCamera(path, t);
   const point = beadScreen(path, view, t, scratch.ball);
 
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
-  ctx.drawImage(assets.bg, 0, 0, view.w, view.h);
+  if (backdrop) ctx.drawImage(assets.bg, 0, 0, view.w, view.h);
   drawGrid(ctx, view, camY);
-  drawBoards(ctx, path, t, view, assets, camY);
+  drawBoards(ctx, path, t, view, assets, camY, lite);
   drawImpacts(ctx, path, t, view, assets, camY);
-  drawTrail(ctx, path, t, view, assets, camY, scratch);
+  if (!lite) drawTrail(ctx, path, t, view, assets, camY, scratch);
   drawBall(ctx, path, view, assets, point.x, point.y, scratch.ball, evalBeadRoll(path, t));
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
-  ctx.drawImage(assets.vignette, 0, 0, view.w, view.h);
+  if (backdrop) ctx.drawImage(assets.vignette, 0, 0, view.w, view.h);
 }
 
 function drawGrid(ctx: Ctx2D, view: View, camY: number): void {
@@ -112,6 +114,7 @@ function drawBoards(
   view: View,
   assets: Assets,
   camY: number,
+  lite: boolean,
 ): void {
   const scale = view.scale;
   const cy = view.h * BALL_SCREEN_RATIO;
@@ -131,7 +134,7 @@ function drawBoards(
     const alpha = 0.2 + 0.8 * smoothstep(entryU);
     const age = t - b.t;
     const hit = age >= 0 && age < 0.5 ? Math.exp(-age / 0.075) : 0;
-    drawBoard(ctx, b, sx, sy, halfW, thick, alpha, hit, assets);
+    drawBoard(ctx, b, sx, sy, halfW, thick, alpha, hit, assets, lite);
   }
 }
 
@@ -145,14 +148,17 @@ function drawBoard(
   alpha: number,
   hit: number,
   assets: Assets,
+  lite: boolean,
 ): void {
   const color = bandColor(b.band);
   const hw = halfW * (1 + 0.07 * hit);
   const th = Math.max(2, thick * (1 - 0.38 * hit));
 
-  ctx.globalCompositeOperation = 'lighter';
-  ctx.globalAlpha = alpha * 0.55;
-  ctx.drawImage(assets.glow[b.band], sx - hw * 1.35, sy - th * 3.2, hw * 2.7, th * 6.4);
+  if (!lite) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = alpha * 0.55;
+    ctx.drawImage(assets.glow[b.band], sx - hw * 1.35, sy - th * 3.2, hw * 2.7, th * 6.4);
+  }
 
   ctx.save();
   ctx.translate(sx, sy);

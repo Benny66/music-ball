@@ -223,6 +223,15 @@ test('自动判定：钢琴 → 音符，鼓组 → 网格', () => {
   console.log(`      piano-90.wav  notes  high=${(r.highRatio ?? 0).toFixed(3)} reg=${(r.quality?.regularity ?? 0).toFixed(2)}`);
 });
 
+test('钢琴低 highRatio 绕过全局锁相网格（保留原始 DP 拍点）', () => {
+  const { pcm, sr } = readWav(join(DIR, 'piano-90.wav'));
+  const r = analyze(pcm, sr, pcm.length / sr);
+  assert.ok((r.highRatio ?? 1) < 0.09, `highRatio=${r.highRatio}`);
+  assert.equal(r.quality?.snapped, 0);
+  assert.equal(r.quality?.drift, 0);
+  assert.ok(r.beats.filter((b) => !b.synthetic).length > 10);
+});
+
 test('模型不可用或音符不足时回退网格', () => {
   const { res } = fixture();
   const fallback = selectRhythmMode(res, fakeMelody(69, 'fft-fallback'), 'auto');

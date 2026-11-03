@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { MelodyNote, MelodyResult } from '../src/analysis/melody.ts';
 import { boardsFromNotes } from '../src/chart/notes.ts';
+import { selectSurfaceImpacts } from '../src/chart/salience.ts';
 import { BALL_R } from '../src/chart/styles.ts';
 import {
   buildBeadChoreography,
@@ -92,6 +93,48 @@ test('impactsFromNotes：沿用 boardsFromNotes 的时间/力度/音高，并补
     assert.equal(impacts[i].side, i % 2 === 0 ? -1 : 1);
   }
   assert.ok(impacts[0].dur >= 0.49, `和弦最大时值 ${impacts[0].dur}`);
+});
+
+test('selectSurfaceImpacts：候选来自音符板、最短间隔成立、结果可复现', () => {
+  const notes: MelodyNote[] = Array.from({ length: 48 }, (_, i) => ({
+    start: 0.3 + i * 0.25,
+    end: 0.3 + i * 0.25 + 0.2,
+    midi: 60 + (i % 12),
+    amplitude: 0.4 + 0.5 * ((i * 7) % 13) / 12,
+  }));
+  const beats = gridBeats(108, 12);
+  const opts = { duration: 12, beats, density: 1.2 };
+  const a = selectSurfaceImpacts(notes, opts);
+  const b = selectSurfaceImpacts(notes, opts);
+  assert.deepEqual(a, b, '同输入必须完全可复现');
+  assert.ok(a.length >= 10, `撞击太少 ${a.length}`);
+
+  const boardTimes = boardsFromNotes(notes, { minGap: 0.125 }).map((x) => x.t);
+  for (const impact of a) {
+    assert.ok(boardTimes.some((t) => Math.abs(t - impact.t) < 1e-9), `不在音符板上 ${impact.t}`);
+  }
+  for (let i = 1; i < a.length; i++) {
+    assert.ok(a[i].t - a[i - 1].t >= 0.5 - 1e-9, `间隔过短 ${a[i].t - a[i - 1].t}`);
+  }
+});
+
+test('selectSurfaceImpacts：三连音段能选到正拍之间的细分起音', () => {
+  const period = 60 / 108;
+  const notes: MelodyNote[] = [];
+  for (let beat = 0; beat < 12; beat++) {
+    for (const frac of [0, 1 / 3, 2 / 3]) {
+      const t = beat * period + frac * period;
+      // 正拍弱、三连音强：只有跟随表面节奏才会选到细分位置
+      notes.push({ start: t, end: t + 0.12, midi: frac === 0 ? 60 : 76, amplitude: frac === 0 ? 0.3 : 1 });
+    }
+  }
+  const beats = gridBeats(108, 8);
+  const impacts = selectSurfaceImpacts(notes, { duration: 6, beats, density: 1.2 });
+  const offGrid = impacts.filter((x) => {
+    const phase = ((x.t / period) % 1 + 1) % 1;
+    return Math.min(phase, 1 - phase) > 0.15;
+  });
+  assert.ok(offGrid.length >= 3, `细分起音太少 ${offGrid.length}/${impacts.length}`);
 });
 
 test('impactsFromBeats：60–180 BPM 按约 1s 抽稀，间隔够滚动+掉落，左右交替', () => {
